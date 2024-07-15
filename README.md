@@ -33,6 +33,14 @@ Role based access control [RBAC] provides fine-grain permissions for granting ac
 
 * [Access Control Lists](specifications/rbac/access-control-lists.md)
 
+### Quotas
+
+in a finite, multi-tenant deployment, compute hardware needs to be made available to those who are contractually entitled to it.
+Quotas allow resources to be shared in a fair and predictable way.
+They also restrict the damage a rogue actor can cause thus also providing improved quality of service and security guarantees.
+
+* [Quota Management](specifications/quotas/quota-management.md)
+
 ### Logging
 
 Logging is more than just for debugging.
