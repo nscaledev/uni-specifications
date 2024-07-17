@@ -18,6 +18,7 @@ This proposal aims to provide a formal specification that allows the best user e
 
 - v1.0.0 2024-05-29 (@spjmurray): Initial RFC
 - v1.0.1 2024-06-06 (@spjmurray): Update to mirror reality
+- v1.0.2 2024-07-17 (@spjmurray): Update ID and name documentation
 
 ## Considerations
 
@@ -27,20 +28,13 @@ Every resource in the system should have the following items, unless where speci
 
 #### Unique Identifier
 
-The resource ID maps to a Kubernetes name, so will still be governed by DNS labels, but also critically compatible with HTTP path segments for use as IDs.
-The proposal is to use Kubernetes name generation to inject 5 characters of entropy into resource names, and prefix them with the resource type.
-
-Because of this, the requirement of namespaces is lifted, e.g. organizations don't need a namespace to separate projects from another organization.
-The logical separation that namespaces gives us is still relevant however, in that we can use namespaces to limit scope in a far safer way than using labels alone.
+The resource ID is a UUIDv4 (i.e. random) string.
+As this directly maps to a Kubernetes resource name, it MUST be compatible with DNS labels.
+As such it MUST start with a character.
 
 #### Resource Name
 
-This is a free-form Unicode string that doesn't have any of the limitations of a DNS label, it can include spaces, punctuation and even i18n.
-
-We do sacrifice the simplicity of having Kubernetes names detect conflicts.
-Clients *should* check this before hand anyway to provide real time feedback, however we will now need to build explicit checks into the API endpoints too.
-
-Storing resource names as labels does allow us to lookup, at the API level, a named resource, but the preference will be to perform discovery via a GET operation against the resource collection endpoint, and other operations against the individual resource endpoint using an ID derived from the initial GET.
+This is a string that is attached to a resource as a label, for index performance.
 
 Using labels limits the character set to that defined [by Kubernetes](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set).
 Annotations on the other hand allow arbitrary text (e.g. it was used for a long time to store JSON for `kubectl apply`).

@@ -18,6 +18,7 @@ Specifications are broken down into conceptual areas as they span multiple compo
 Unikorn components are split up into micro-services with RESTful APIs that can be leveraged by Web browsers, CLI tools etc.
 API specifications document common API conventions that apply across the platform to foster code reuse.
 
+* [API Design](specifications/api/design.md)
 * [API Resource Metadata](specifications/api/resource-metdata.md)
 
 ### RBAC
