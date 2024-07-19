@@ -19,6 +19,7 @@ This proposal aims to provide a formal specification that allows the best user e
 - v1.0.0 2024-05-29 (@spjmurray): Initial RFC
 - v1.0.1 2024-06-06 (@spjmurray): Update to mirror reality
 - v1.0.2 2024-07-17 (@spjmurray): Update ID and name documentation
+- v1.0.3 2024-07-19 (@spjmurray): Add audit fields
 
 ## Considerations
 
@@ -49,6 +50,11 @@ The description should be a verbose description of what the resource is for, use
 Creation time is useful to see the age of a resource, and offers the ability to sort by age to better locate a resource in a client.
 
 The deletion time is an indication that resource deletion has been requested, and thus other calls to edit or delete the resource should be inhibited to avoid false negative errors.
+
+#### Auditing
+
+Audit logs may be time-bound due to space constraints, so we should endeavor to keep track of the actor who is responsible for creating and modifying an object.
+Additionally we need to record the modification time.
 
 #### Provisioning Status
 
@@ -88,6 +94,7 @@ components:
       - provisioned
       - deprovisioning
       - error
+    # Common metadata across reads/writes e.g. API mutable.
     resourceMetadata:
       type: object
       required:
@@ -98,20 +105,41 @@ components:
           type: string
         description:
           type: string
-    resourceReadMetadata:
+    # Things that every resource may have.
+    staticResourceMetadata:
+      type: object
       allOf:
       - $ref: '#/components/schemas/resourceMetadata'
       - type: object
         required:
         - id
         - creationTime
-        - provisioningStatus
         properties:
           id:
+            description: The unique resource ID.
             type: string
           creationTime:
+            description: The time the resource was created.
             type: string
             format: date-time
+          createdBy:
+            description: The user who created the resource.
+            type: string
+          updateTime:
+            description: The time a resource was updated.
+            type: string
+            format: date-time
+          updatedBy:
+            description: The user who updated the resource.
+            type: string
+    # Things that only Kubernetes based resources may have.
+    resourceReadMetadata:
+      allOf:
+      - $ref: '#/components/schemas/staticResourceMetadata'
+      - type: object
+        required:
+        - provisioningStatus
+        properties:
           deletionTime:
             type: string
             format: date-time
