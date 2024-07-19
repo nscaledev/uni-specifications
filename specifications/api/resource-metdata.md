@@ -125,11 +125,11 @@ components:
           createdBy:
             description: The user who created the resource.
             type: string
-          updateTime:
+          modifiedTime:
             description: The time a resource was updated.
             type: string
             format: date-time
-          updatedBy:
+          modifiedBy:
             description: The user who updated the resource.
             type: string
     # Things that only Kubernetes based resources may have.
