@@ -12,6 +12,7 @@ While this problem applies to CPUs too, that's readily supported by OpenStack fo
 ## Changelog
 
 - v1.0.0 2024-06-26 (@spjmurray): Initial RFC
+- v1.0.1 2024-07-23 (@spjmurray): Updated metadata values
 
 ## Applying Images to Hardware
 
@@ -95,7 +96,7 @@ spec:
           baremetal: true
           gpu:
             vendor: AMD
-            model: Mi250
+            model: MI250X
             memory: 192Gi
             count: 2
 ```
@@ -126,7 +127,7 @@ As defined by this specification we expect:
 {
   "properties": {
     "unikorn:gpu_vendor": "AMD",
-    "unikorn:gpu_models": "Mi250,Mi300",
+    "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
     "unikorn:kubernetes_version": "v1.2.3",
     "unikorn:virtualization": "any",
@@ -148,3 +149,31 @@ The digest is a digital signature that may (but is highly recommended to) be app
 > At present this is the base64 encoded SHA256 hash of the image ID, but we may in future extend this to include a hash over the metadata as well to detect any tampering that may cause platform failure.
 > For example `SHA256(ID | key=value[,key=value]*)` where keys are lexically ordered.
 
+## Standardized Metadata Values
+
+Given one team may be responsible for generating images, and another for deploying and managing the system, we need to ensure values given for flavors and images match up in order to facilitate correct image selection.
+
+While the system allows arbitrary values, and encourages you to treat them as such to avoid hard coding vendor specifics where possible, we need to define a set of recommended values.
+This allows, for example, vendor logos to be displayed in UI components.
+
+### GPU Vendors
+
+| Vendor | Description |
+| --- | --- |
+| AMD | GPUs by AMD |
+| NVIDIA | GPUs by NVIDIA |
+
+### AMD GPU Models
+
+| Model | Description |
+| --- | --- |
+| MI250X | AMD Instinct MI250X |
+| MI300X | AMD Instinct MI300X |
+
+### NVIDIA GPU Models
+
+| Model | Description |
+| --- | --- |
+| A100 | NVIDIA A100 Tensor Core |
+| H100 | NVIDIA H100 Tensor Core |
+| H200 | NVIDIA H200 Tensor Core |
