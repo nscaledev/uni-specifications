@@ -43,3 +43,4 @@ Where platform specific configuration and setup is required, or coordination is 
 #### OpenStack
 
 * [Flavor and Image Handling](specifications/providers/openstack/flavors_and_images.md)
+* [External Networks](specifications/providers/openstack/external-networks.md)
