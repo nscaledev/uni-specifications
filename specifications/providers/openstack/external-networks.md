@@ -68,15 +68,15 @@ kind: Region
 spec:
   openstack:
     network:
-      external:
-        # Policy, may also be "Tags"
-        policy: Explicit
-        # Explcit network, when policy is "Explicit"
-      	explicit:
-          networkID: 623bcaf3-7785-496a-a7d9-12919bce5b0f
-        # Tag based selection when policy is "Tags"
-        tags:
-       	  include:
+      externalNetworks:
+        # Selector defines what neworks to include in the working set,
+        # this is a boolean intersection of all filters defined below.
+        selector:
+          # Explicit set of network IDs.
+          ids:
+          - 623bcaf3-7785-496a-a7d9-12919bce5b0f
+          # Implict selection of networks that have all these tags.
+          tags:
           - unikorn:external-network
 ```
 
