@@ -21,6 +21,12 @@ API specifications document common API conventions that apply across the platfor
 * [API Design](specifications/api/design.md)
 * [API Resource Metadata](specifications/api/resource-metdata.md)
 
+### Security
+
+Top level security concerns are addressed here.
+
+* [Security Model](specifications/security/security-model.md)
+
 ### RBAC
 
 Role based access control [RBAC] provides fine-grain permissions for granting access to resources within the platform.
