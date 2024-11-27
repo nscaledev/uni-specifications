@@ -46,7 +46,7 @@ Annotations do however suggest the metadata is non-identifying, and cannot be us
 
 The description should be a verbose description of what the resource is for, useful where names have a specific schema, that is non-intuitive, and you want to give additional detail to viewers so they don't accidentally delete something.
 
-#### Resource Tags
+#### Resource Tags **OPTIONAL**
 
 Every resource should support metadata tags.
 The idea here is that a resource can be consumed by higher level services, and those services may need to map some form of configuration to a resource for reconciliation.
@@ -101,10 +101,20 @@ components:
       - provisioned
       - deprovisioning
       - error
-    tags:
+    tag:
       type: object
-      additionalProperies:
-        type: string
+      required:
+      - name
+      - value
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+    tagList:
+      type: array
+      items:
+        $ref: '#/components/schemas/tag'
     # Common metadata across reads/writes e.g. API mutable.
     resourceMetadata:
       type: object
@@ -117,7 +127,7 @@ components:
         description:
           type: string
         tags:
-          $ref: '#/components/schemas/tags'
+          $ref: '#/components/schemas/tagList'
     # Things that every resource may have.
     staticResourceMetadata:
       type: object
