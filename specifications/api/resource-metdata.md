@@ -20,6 +20,7 @@ This proposal aims to provide a formal specification that allows the best user e
 - v1.0.1 2024-06-06 (@spjmurray): Update to mirror reality
 - v1.0.2 2024-07-17 (@spjmurray): Update ID and name documentation
 - v1.0.3 2024-07-19 (@spjmurray): Add audit fields
+- v1.0.4 2024-11-27 (@spjmurray): Add metadata tags
 
 ## Considerations
 
@@ -44,6 +45,12 @@ Annotations do however suggest the metadata is non-identifying, and cannot be us
 #### Resource Description **OPTIONAL**
 
 The description should be a verbose description of what the resource is for, useful where names have a specific schema, that is non-intuitive, and you want to give additional detail to viewers so they don't accidentally delete something.
+
+#### Resource Tags
+
+Every resource should support metadata tags.
+The idea here is that a resource can be consumed by higher level services, and those services may need to map some form of configuration to a resource for reconciliation.
+Where names cannot be used to perform the mapping directly, tags offer a richer and less restrictive key-value store to apply generic metadata to a resource.
 
 #### Creation and Deletion Time
 
@@ -94,6 +101,10 @@ components:
       - provisioned
       - deprovisioning
       - error
+    tags:
+      type: object
+      additionalProperies:
+        type: string
     # Common metadata across reads/writes e.g. API mutable.
     resourceMetadata:
       type: object
@@ -105,6 +116,8 @@ components:
           type: string
         description:
           type: string
+        tags:
+          $ref: '#/components/schemas/tags'
     # Things that every resource may have.
     staticResourceMetadata:
       type: object
