@@ -126,10 +126,13 @@ As defined by this specification we expect:
 ```json
 {
   "properties": {
-    "unikorn:os_name": "Ubuntu",
-    "unikorn:os_version": "24.04",
-    "unikorn:os_family": "Debian",
-    "unikorn:tags": "slurmd=24.11,wireguard=1.0",
+    "unikorn:os:kernel": "linux",
+    "unikorn:os:familiy": "debian",
+    "unikorn:os:distro": "ubuntu",
+    "unikorn:os:variant": "server",
+    "unikorn:os:codename": "Noble Numbat",
+    "unikorn:os:version": "24.04",
+    "unikorn:packages": "slurmd=24.11,wireguard=1.0",
     "unikorn:gpu_vendor": "AMD",
     "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
@@ -140,9 +143,19 @@ As defined by this specification we expect:
 }
 ```
 
-The Image OS fields (name, version and family) describes the operating system in use. `os_name`, `os_version` and `os_family` defines the full name, version and family of the operating system.
+`unikorn:os:kernel` specifies the kernel used by the operating system (e.g., linux, windows).
 
-The `tags` field is particularly helpfull for filtering images based on the software stack they contain. It can be used to easily identify images with specific tools or configuration.
+`unikorn:os:familiy` defines the operating system family, which typically determines the package format (e.g., debian, redhat).
+
+`unikorn:os:distro` indicates the specific operating system distribution (e.g., ubuntu, centos).
+
+`unikorn:os:variant` is an optional field and define the variant or edition of the operating system, such as "server" or "desktop".
+
+`unikorn:os:codename` is an optional field and refers to the codename for the operating system release (e.g., Noble Numbat).
+
+`unikorn:os:version`specifies the version of the operating system (e.g., 24.04, 20.04).
+
+`unikorn:packages` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain.
 
 The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
 The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
