@@ -126,6 +126,10 @@ As defined by this specification we expect:
 ```json
 {
   "properties": {
+    "unikorn:os_name": "Ubuntu",
+    "unikorn:os_version": "24.04",
+    "unikorn:os_family": "Debian",
+    "unikorn:tags": "slurmd=24.11,wireguard=1.0",
     "unikorn:gpu_vendor": "AMD",
     "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
@@ -135,6 +139,10 @@ As defined by this specification we expect:
   }
 }
 ```
+
+The Image OS fields (name, version and family) describes the operating system in use. `os_name`, `os_version` and `os_family` defines the full name, version and family of the operating system.
+
+The `tags` field is particularly helpfull for filtering images based on the software stack they contain. It can be used to easily identify images with specific tools or configuration.
 
 The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
 The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
