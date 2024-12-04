@@ -13,6 +13,10 @@ While this problem applies to CPUs too, that's readily supported by OpenStack fo
 
 - v1.0.0 2024-06-26 (@spjmurray): Initial RFC
 - v1.0.1 2024-07-23 (@spjmurray): Updated metadata values
+- v2.0.0 2024-12-04 (@nsricardor):
+  - **Added** new image metadata properties to describe the operating system: `unikorn:os:*` 
+  - **Added** new image metadata property to list packages availables on the image: `unikorn:package:*`
+  - **Removed** the image property `unikorn:kubernetes_version`, now replaced by `unikorn:package:kubernetes`
 
 ## Applying Images to Hardware
 
@@ -132,11 +136,11 @@ As defined by this specification we expect:
     "unikorn:os:variant": "server",
     "unikorn:os:codename": "Noble Numbat",
     "unikorn:os:version": "24.04",
-    "unikorn:packages": "slurmd=24.11,wireguard=1.0",
+    "unikorn:package:kubernetes": "x.y.z",
+    "unikorn:package:slurmd": "x.y.z",
     "unikorn:gpu_vendor": "AMD",
     "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
-    "unikorn:kubernetes_version": "v1.2.3",
     "unikorn:virtualization": "any",
     "unikorn:digest": "ZnViYXI="
   }
@@ -155,12 +159,10 @@ As defined by this specification we expect:
 
 `unikorn:os:version`specifies the version of the operating system (e.g., 24.04, 20.04).
 
-`unikorn:packages` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain.
+`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain (e.g. unikorn:package:kubernetes: x.y.z). 
 
 The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
 The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
-
-The Kubernetes fields are optional and only defined when intended to be used for deployment of Kubernetes services.
 
 The virtualization fields define where the image can be used, `any` means it can be used anywhere, `baremetal` and `virtualized` indicate it can be only used on flavors that match that usage.
 
