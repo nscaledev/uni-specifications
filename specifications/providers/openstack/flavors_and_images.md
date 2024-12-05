@@ -136,8 +136,8 @@ As defined by this specification we expect:
     "unikorn:os:variant": "server",
     "unikorn:os:codename": "Noble Numbat",
     "unikorn:os:version": "24.04",
-    "unikorn:package:kubernetes": "x.y.z",
-    "unikorn:package:slurmd": "x.y.z",
+    "unikorn:package:kubernetes": "v1.2.3",
+    "unikorn:package:slurmd": "v1.2.3",
     "unikorn:gpu_vendor": "AMD",
     "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
@@ -159,7 +159,7 @@ As defined by this specification we expect:
 
 `unikorn:os:version`specifies the version of the operating system (e.g., 24.04, 20.04).
 
-`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain (e.g. unikorn:package:kubernetes: x.y.z). 
+`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3). 
 
 The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
 The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
@@ -200,3 +200,23 @@ This allows, for example, vendor logos to be displayed in UI components.
 | A100 | NVIDIA A100 Tensor Core |
 | H100 | NVIDIA H100 Tensor Core |
 | H200 | NVIDIA H200 Tensor Core |
+
+### OS Kernel
+
+| Value | Description |
+| --- | --- |
+| linux | Linux |
+
+### OS Family
+
+| Value | Description |
+| --- | --- |
+| debian | Debian |
+| redhat | Redhat |
+
+### OS Distro
+
+| Value | Description |
+| --- | --- |
+| rocky | Rocky |
+| ubuntu | Ubuntu |
