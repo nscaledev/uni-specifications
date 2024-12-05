@@ -157,7 +157,7 @@ As defined by this specification we expect:
 
 `unikorn:os:codename` is an optional field and refers to the codename for the operating system release (e.g., Noble Numbat).
 
-`unikorn:os:version`specifies the version of the operating system (e.g., 24.04, 20.04).
+`unikorn:os:version` specifies the version of the operating system (e.g., 24.04, 20.04).
 
 `unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3). 
 
