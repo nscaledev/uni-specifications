@@ -17,6 +17,7 @@ While this problem applies to CPUs too, that's readily supported by OpenStack fo
   - **Added** new image metadata properties to describe the operating system: `unikorn:os:*` 
   - **Added** new image metadata property to list packages availables on the image: `unikorn:package:*`
   - **Removed** the image property `unikorn:kubernetes_version`, now replaced by `unikorn:package:kubernetes`
+- v2.0.1 2024-12-05 (@nsricardor): Fix image property `unikorn:os:family` typo
 
 ## Applying Images to Hardware
 
@@ -131,7 +132,7 @@ As defined by this specification we expect:
 {
   "properties": {
     "unikorn:os:kernel": "linux",
-    "unikorn:os:familiy": "debian",
+    "unikorn:os:family": "debian",
     "unikorn:os:distro": "ubuntu",
     "unikorn:os:variant": "server",
     "unikorn:os:codename": "Noble Numbat",
@@ -149,7 +150,7 @@ As defined by this specification we expect:
 
 `unikorn:os:kernel` specifies the kernel used by the operating system (e.g., linux, windows).
 
-`unikorn:os:familiy` defines the operating system family, which typically determines the package format (e.g., debian, redhat).
+`unikorn:os:family` defines the operating system family, which typically determines the package format (e.g., debian, redhat).
 
 `unikorn:os:distro` indicates the specific operating system distribution (e.g., ubuntu, centos).
 
