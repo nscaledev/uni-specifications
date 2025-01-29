@@ -395,12 +395,13 @@ The API server is responsible for ensuring that the aggregation of all allocatio
 > Once set the resource kind and ID are immutable.
 > It makes no sense to allow that as in Kubernetes it would have been deleted!
 
+> [!NOTE]
+> The API deliberately doesn't expose and `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
+
+
 #### `DELETE`
 
 _No body_
-
-> [!NOTE]
-> The API deliberately doesn't expose and `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
 
 #### RBAC
 
