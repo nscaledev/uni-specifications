@@ -96,7 +96,7 @@ Wouldn't it be far better to let the system place it where it can be scheduled?
 
 Going back to earlier points on logical regions, wouldn't is be okay to just place it wherever it fits based on some optional scheduling hints e.g. cost?
 
-[!NOTE]
+> [!NOTE]
 > Anecdotally it's like a pub when you ask for "a lager", they will always serve you the most expensive premium brand unless you place some constraints on them...
 
 ![nice to have](https://img.shields.io/badge/nice_to_have-red)
@@ -168,7 +168,7 @@ APIs will need to be designed so organization administrators and platform admini
 
 This API should be readable by everyone and is used for summaries, visualization and checking whether a creation request can be fulfilled by a client.
 
-[!NOTE]
+> [!NOTE]
 > A future extension point could be the `/api/v1/organizations/{organizationID}/projects/{projectID}/quotas` route.
 > We'd then need to make a top-level distinction about resources that are free-for-all and those that are allocated to specific projects.
 
@@ -213,7 +213,7 @@ This API should be readable by everyone and is used for summaries, visualization
 }
 ```
 
-[!NOTE]
+> [!NOTE]
 > `committed` are things that always exist, `reserved` are for things like cluster autoscaling.
 
 #### `PUT`
@@ -282,7 +282,7 @@ It's also used to create individual allocations.
 ]
 ```
 
-[!NOTE]
+> [!NOTE]
 > Allocations will be filtered by the API based on project ACLs.
 > This can be filtered by project ID and reduced to a per-project overall utilization view.
 
@@ -315,7 +315,7 @@ It's also used to create individual allocations.
 ]
 ```
 
-[!NOTE]
+> [!NOTE]
 > The API deliberately doesn't expose and `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
 
 #### RBAC
@@ -391,7 +391,7 @@ The API server is responsible for ensuring that the aggregation of all allocatio
 }
 ```
 
-[!NOTE]
+> [!NOTE]
 > Once set the resource kind and ID are immutable.
 > It makes no sense to allow that as in Kubernetes it would have been deleted!
 
@@ -399,7 +399,7 @@ The API server is responsible for ensuring that the aggregation of all allocatio
 
 _No body_
 
-[!NOTE]
+> [!NOTE]
 > The API deliberately doesn't expose and `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
 
 #### RBAC
