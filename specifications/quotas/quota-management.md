@@ -15,6 +15,7 @@ From a user experience perspective an organization admin can:
 ## Changelog
 
 - v1.0.0 2025-01-29 (@spjmurray): Initial RFC
+- v1.0.1 2025-01-29 (@spjmurray): Update to reflect implementation.
 
 ## Problem Analysis
 
@@ -164,6 +165,33 @@ APIs will need to be designed so organization administrators and platform admini
 
 ## Specification
 
+### `/spi/v1/quotas`
+
+This API returns metadata about the quotas in the system.
+Quotas are extensible, and may be defined by 3rd party integrations, so we want the UX to be dynamic.
+
+#### `GET`
+
+```json
+[
+    {
+        "name": "clusters",
+        "displayName": "Clusters",
+        "description": "All cluster types e.g. Kubernetes, compute, etc.",
+        "default": 10
+    }
+]
+```
+
+#### RBAC
+
+| Actor | Permissions |
+| --- | --- |
+| platform-administrator | read |
+| administrator | read |
+| user | read |
+| reader | read |
+
 ### `/api/v1/organizations/{organizationID}/quotas`
 
 This API should be readable by everyone and is used for summaries, visualization and checking whether a creation request can be fulfilled by a client.
@@ -178,34 +206,32 @@ This API should be readable by everyone and is used for summaries, visualization
 {
     "capacity": [
         {
-            "type": "clusters",
-            "amount": 5
+            "kind": "clusters",
+            "quantity": 5
         },
         {
-            "type": "servers",
-            "amount": 10
+            "kind": "servers",
+            "quantity": 10
         }
     ],
     "free": [
         {
-            "type": "clusters",
-            "amount": 4
+            "kind": "clusters",
+            "quantity": 4
         },
         {
-            "type": "servers",
-            "amount": 2
+            "kind": "servers",
+            "quantity": 2
         }
     ],
     "allocated": [
         {
-            "type": "clusters",
-            "amount": 1,
+            "kind": "clusters",
             "committed": 1,
             "reserved": 0
         },
         {
-            "type": "servers",
-            "amount": 8,
+            "kind": "servers",
             "committed": 3,
             "reserved": 5
         }
@@ -222,12 +248,12 @@ This API should be readable by everyone and is used for summaries, visualization
 {
     "capacity": [
         {
-            "type": "clusters",
-            "amount": 5
+            "kind": "clusters",
+            "quantity": 5
         },
         {
-            "type": "servers",
-            "amount": 10
+            "kind": "servers",
+            "quantity": 10
         }
     ]
 }
@@ -265,14 +291,12 @@ It's also used to create individual allocations.
             "id": "d6beb0dd-209b-40bf-aa03-bef974f33121"
             "resources": [
                 {
-                    "type": "clusters",
-                    "amount": 1,
+                    "kind": "clusters",
                     "committed": 1,
                     "reserved": 0
                 },
                 {
-                    "type": "servers",
-                    "amount": 8,
+                    "kind": "servers",
                     "commited": 3,
                     "reserved": 5
                 },
@@ -300,12 +324,12 @@ It's also used to create individual allocations.
             "id": "d6beb0dd-209b-40bf-aa03-bef974f33121"
             "resources": [
                 {
-                    "type": "clusters",
+                    "kind": "clusters",
                     "committed": 1,
                     "reserved": 0
                 },
                 {
-                    "type": "servers",
+                    "kind": "servers",
                     "commited": 3,
                     "reserved": 5
                 },
@@ -350,14 +374,12 @@ The API server is responsible for ensuring that the aggregation of all allocatio
         "id": "d6beb0dd-209b-40bf-aa03-bef974f33121"
         "resources": [
             {
-                "type": "clusters",
-                "amount": 1,
+                "kind": "clusters",
                 "committed": 1,
                 "reserved": 0
             },
             {
-                "type": "servers",
-                "amount": 8,
+                "kind": "servers",
                 "commited": 3,
                 "reserved": 5
             },
@@ -377,12 +399,12 @@ The API server is responsible for ensuring that the aggregation of all allocatio
     "spec": {
         "resources": [
             {
-                "type": "clusters",
+                "kind": "clusters",
                 "committed": 1,
                 "reserved": 0
             },
             {
-                "type": "servers",
+                "kind": "servers",
                 "commited": 3,
                 "reserved": 12
             },
