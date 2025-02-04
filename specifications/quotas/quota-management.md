@@ -15,7 +15,8 @@ From a user experience perspective an organization admin can:
 ## Changelog
 
 - v1.0.0 2025-01-29 (@spjmurray): Initial RFC
-- v1.0.1 2025-01-29 (@spjmurray): Update to reflect implementation.
+- v1.0.1 2025-02-03 (@spjmurray): Update to reflect implementation.
+- v1.0.2 2025-02-04 (@spjmurray): Aggregate quotas and metadata into a single API.
 
 ## Problem Analysis
 
@@ -165,33 +166,6 @@ APIs will need to be designed so organization administrators and platform admini
 
 ## Specification
 
-### `/spi/v1/quotas`
-
-This API returns metadata about the quotas in the system.
-Quotas are extensible, and may be defined by 3rd party integrations, so we want the UX to be dynamic.
-
-#### `GET`
-
-```json
-[
-    {
-        "name": "clusters",
-        "displayName": "Clusters",
-        "description": "All cluster types e.g. Kubernetes, compute, etc.",
-        "default": 10
-    }
-]
-```
-
-#### RBAC
-
-| Actor | Permissions |
-| --- | --- |
-| platform-administrator | read |
-| administrator | read |
-| user | read |
-| reader | read |
-
 ### `/api/v1/organizations/{organizationID}/quotas`
 
 This API should be readable by everyone and is used for summaries, visualization and checking whether a creation request can be fulfilled by a client.
@@ -204,37 +178,18 @@ This API should be readable by everyone and is used for summaries, visualization
 
 ```json
 {
-    "capacity": [
+    "quotas": [
         {
             "kind": "clusters",
-            "quantity": 5
-        },
-        {
-            "kind": "servers",
-            "quantity": 10
-        }
-    ],
-    "free": [
-        {
-            "kind": "clusters",
-            "quantity": 4
-        },
-        {
-            "kind": "servers",
-            "quantity": 2
-        }
-    ],
-    "allocated": [
-        {
-            "kind": "clusters",
+            "quantity": 5,
+            "used": 1,
+            "free": 4,
             "committed": 1,
-            "reserved": 0
+            "reserved": 0,
+            "displayName": "Clusters",
+            "description": "All cluster types e.g. Kubernetes, compute, etc.",
+            "default": 5
         },
-        {
-            "kind": "servers",
-            "committed": 3,
-            "reserved": 5
-        }
     ]
 }
 ```
@@ -246,14 +201,10 @@ This API should be readable by everyone and is used for summaries, visualization
 
 ```json
 {
-    "capacity": [
+    "quotas": [
         {
             "kind": "clusters",
             "quantity": 5
-        },
-        {
-            "kind": "servers",
-            "quantity": 10
         }
     ]
 }
@@ -418,7 +369,7 @@ The API server is responsible for ensuring that the aggregation of all allocatio
 > It makes no sense to allow that as in Kubernetes it would have been deleted!
 
 > [!NOTE]
-> The API deliberately doesn't expose and `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
+> The API deliberately doesn't expose an `amount` field as seen in the GET, as you could conceivably balls up the simple addition and lead to inconsistency.
 
 
 #### `DELETE`
