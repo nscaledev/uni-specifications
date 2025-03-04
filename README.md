@@ -33,6 +33,12 @@ Role based access control [RBAC] provides fine-grain permissions for granting ac
 
 * [Access Control Lists](specifications/rbac/access-control-lists.md)
 
+### User Management
+
+Getting people onto a public cloud platform in a safe and secure manner.
+
+* [User Account Creation](specifications/identity/onboarding.md)
+
 ### Quotas
 
 in a finite, multi-tenant deployment, compute hardware needs to be made available to those who are contractually entitled to it.
