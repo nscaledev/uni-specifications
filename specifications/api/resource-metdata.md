@@ -21,6 +21,7 @@ This proposal aims to provide a formal specification that allows the best user e
 - v1.0.2 2024-07-17 (@spjmurray): Update ID and name documentation
 - v1.0.3 2024-07-19 (@spjmurray): Add audit fields
 - v1.0.4 2024-11-27 (@spjmurray): Add metadata tags
+- v1.1.0 2025-05-21 (@spjmurray): Add health status
 
 ## Considerations
 
@@ -68,7 +69,11 @@ Additionally we need to record the modification time.
 Typically this maps directly from a Kubernetes status condition, but to future proof things we should make it generic so we can add health monitoring to any resource trivially in future even if it doesn't have a Kubernetes controller.
 This makes client handling far simpler.
 
-By making this explicitly about provisioning, we can extend the metadata further with asynchronous health checks further down the line.
+#### Health Status
+
+This is an asynchronous health status that can be checked outside of the usual provisioning flow.
+This provides at a glance monitoring of whether Helm applications that underpin resources are correctly synchronized and healthy.
+This can also be extended to infrastructure e.g. is my VM powered on etc.
 
 ### Scoped Metadata
 
@@ -101,6 +106,12 @@ components:
       - provisioned
       - deprovisioning
       - error
+    resourceHealthStatus:
+      type: string
+      enum:
+      - unknown
+      - healthy
+      - degraded
     tag:
       type: object
       required:
