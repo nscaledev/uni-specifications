@@ -26,6 +26,11 @@ API specifications document common API conventions that apply across the platfor
 Top level security concerns are addressed here.
 
 * [Security Model](specifications/security/security-model.md)
+* [Authentication Modes](specifications/identity/authentication_modes.md)
+
+### Workload Identity
+
+* [Identity Principals and Proxies](specifications/identity/principals.md)
 
 ### RBAC
 
