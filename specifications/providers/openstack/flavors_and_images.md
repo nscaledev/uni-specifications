@@ -152,32 +152,24 @@ As defined by this specification we expect:
 }
 ```
 
-`unikorn:os:kernel` specifies the kernel used by the operating system (e.g., linux, windows).
+All formats are specified in Typescript.
 
-`unikorn:os:family` defines the operating system family, which typically determines the package format (e.g., debian, redhat).
-
-`unikorn:os:distro` indicates the specific operating system distribution (e.g., ubuntu, centos).
-
-`unikorn:os:variant` is an optional field and define the variant or edition of the operating system, such as "server" or "desktop".
-
-`unikorn:os:codename` is an optional field and refers to the codename for the operating system release (e.g., Noble Numbat).
-
-`unikorn:os:version` specifies the version of the operating system (e.g., 24.04, 20.04).
-
-`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3).
-
-`unikorn:organization:*` are optional and if exist denote that the image must be considered private and scoped only to the organization whose UNI organization name matches that specified in `unikorn:organization:id`.  If `unikorn:organization:projects` exists, then the image is scoped to a specific subset of projects within that organization.
-
-The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
-The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
-
-The virtualization fields define where the image can be used, `any` means it can be used anywhere, `baremetal` and `virtualized` indicate it can be only used on flavors that match that usage.
-
-The digest is a digital signature that may (but is highly recommended to) be applied to images to aid in image visibility and integrity.
-
-> [!NOTE]
-> At present this is the base64 encoded SHA256 hash of the image ID, but we may in future extend this to include a hash over the metadata as well to detect any tampering that may cause platform failure.
-> For example `SHA256(ID | key=value[,key=value]*)` where keys are lexically ordered.
+|Field|Required|Format|Description|
+|---|---|---|---|
+|unikorn:os:kernel|:white_check_mark:|"linux"|Specifies the kernel used by the operating system.|
+|unikorn:os:family|:white_check_mark:|"debian" \| "redhat"|Defines the operating system family, which typically determines the package format.|
+|unikorn:os:distro|:white_check_mark:|"ubuntu" \| "rocky"|Indicates the specific operating system distribution.|
+|unikorn:os:variant|:x:|string|Defines the variant or edition of the operating system, such as "server" or "desktop".|
+|unikorn:os:codename|:x:|string|Defines the codename for the operating system release (e.g., Noble Numbat).|
+|unikorn:os:version|:white_check_mark:|string|Specifies the version of the operating system (e.g., 24.04, 20.04).|
+|unikorn:package:\*|:x:|string|An installed package, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3).|
+|unikorn:gpu_vendor|:x:|"NVIDIA" \| "AMD"|Specifies the GPU vendor an image has a driver for and is used to filter images based on flavor.|
+|unikorn:gpu_models|:x:|string|If `unikorn:gpu_vendor` is specified then this must be set.  Defines the GPU models a GPU driver supports and is used to filter images based on flavor. **NOTE** this uses a legacy CSV format.|
+|unikorn:gpu_driver_version|:x:|string|If `unikorn:gpu_vendor` is specified then this must be set.  Defines the GPU driver version|
+|unikorn:virtualization|:x:|"any" \| "baremetal" \| "virtualized"|The virtualization fields define where the image can be used, `any` means it can be used anywhere, `baremetal` and `virtualized` indicate it can be only used on flavors that match that usage.|
+|unikorn:digest|:x:|string|The digest is a digital signature that may be applied to images to aid in image selection and integrity.  This is the base64 encoded SHA256 hash of the image ID, and doesn't include any other meatadata at present.|
+|unikorn:organization:id|:x:|string|An optional organization ID to restrict the image to.  The image will be considered private and scoped only to the organization whose organization ID matches.|
+|unikorn:organization:projects|:x:|Array&lt;string&gt;|If `unikorn:organization:id` is specified, this further scopes the image to a specific set of projects within that organization.|
 
 ## Standardized Metadata Values
 
@@ -185,13 +177,6 @@ Given one team may be responsible for generating images, and another for deployi
 
 While the system allows arbitrary values, and encourages you to treat them as such to avoid hard coding vendor specifics where possible, we need to define a set of recommended values.
 This allows, for example, vendor logos to be displayed in UI components.
-
-### GPU Vendors
-
-| Vendor | Description |
-| --- | --- |
-| AMD | GPUs by AMD |
-| NVIDIA | GPUs by NVIDIA |
 
 ### AMD GPU Models
 
@@ -207,23 +192,3 @@ This allows, for example, vendor logos to be displayed in UI components.
 | A100 | NVIDIA A100 Tensor Core |
 | H100 | NVIDIA H100 Tensor Core |
 | H200 | NVIDIA H200 Tensor Core |
-
-### OS Kernel
-
-| Value | Description |
-| --- | --- |
-| linux | Linux |
-
-### OS Family
-
-| Value | Description |
-| --- | --- |
-| debian | Debian |
-| redhat | Redhat |
-
-### OS Distro
-
-| Value | Description |
-| --- | --- |
-| rocky | Rocky |
-| ubuntu | Ubuntu |
