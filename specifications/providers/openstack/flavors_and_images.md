@@ -61,9 +61,11 @@ Images also need to communicate the following, these are considered mutable e.g.
 * GPU models (driver may be compatible with multiple models)
 * GPU physical memory
 * GPU driver version (some people may care about this, ideally we should strive to keep people updated as part of a service so this is never a problem, merely a prompt that we need to roll out an upgrade if required).
+* Organization and project association
 
 Images are, at present, automatically selected by the system, the algorithm would look like:
 
+* Filter for organization and project scoping
 * Find all images that fulfill the optional Kubernetes requirement
 * Find all images that fulfill the virtual or baremetal requirement
 * Find all images that fulfill the GPU vendor requirement
@@ -143,7 +145,9 @@ As defined by this specification we expect:
     "unikorn:gpu_models": "MI250X,MI300X",
     "unikorn:gpu_driver_version": "v1.2.3",
     "unikorn:virtualization": "any",
-    "unikorn:digest": "ZnViYXI="
+    "unikorn:digest": "ZnViYXI=",
+    "unikorn:organization:id": "d1806ad6-8350-4751-a875-02f6a2520b35",
+    "unikorn:organization:projects": ["a1d1f148-b80f-466f-afc7-a965746139d9", "a1d1f148-b80f-466f-afc7-a965746139d9"]
   }
 }
 ```
@@ -160,7 +164,9 @@ As defined by this specification we expect:
 
 `unikorn:os:version` specifies the version of the operating system (e.g., 24.04, 20.04).
 
-`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3). 
+`unikorn:package:*` is an optional list of installed packages, particularly helpful for filtering images based on the software stack they contain. The key, prefixed with `unikorn:package:` represents the package name, and the value specifies its version semver format (e.g. unikorn:package:kubernetes: v1.2.3).
+
+`unikorn:organization:*` are optional and if exist denote that the image must be considered private and scoped only to the organization whose UNI organization name matches that specified in `unikorn:organization:id`.  If `unikorn:organization:projects` exists, then the image is scoped to a specific subset of projects within that organization.
 
 The GPU fields are optional, the existence of `gpu_vendor` defines this as compatible with a GPU flavor, and the `gpu_models` and `gpu_driver_version` are required.
 The `gpu_models` is formatted as a CSV, and must correspond exactly to values defined by flavor mapping.
