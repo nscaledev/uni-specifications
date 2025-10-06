@@ -10,6 +10,12 @@ For work that defines an interface for an external 3rd party entity e.g. logging
 
 Specifications are broken down into conceptual areas as they span multiple components.
 
+### Architecture
+
+How components relate to one another, communicate with one another and their boundaries:
+
+* [Data Architecture](specifications/architecture/data_architecture.md)
+
 ### API
 
 Components are split up into micro-services with RESTful APIs that can be leveraged by Web browsers, CLI tools etc.
