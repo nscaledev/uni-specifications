@@ -1,74 +1,16 @@
 # Specifications
 
-## Overview
+## Platform Specification
 
-This is the central location for all specifications that are implemented by components.
-Large bodies of work should have a specification created and approved before starting any work.
-For work that defines an interface for an external 3rd party entity e.g. logging, UX, a specification forms an interface contract and is mandatory.
+The **[Unified Architectural Specification](SPECIFICATION.md)** is the single source of truth for the Nscale Cloud Platform. It is the normative reference for all engineers and AI automation agents. Any code or design that does not conform to it is a defect.
 
-## Index
+Each service repository contains a `CLAUDE.md` that references this document. AI agents should fetch the raw content of `SPECIFICATION.md` directly for full platform context.
 
-Specifications are broken down into conceptual areas as they span multiple components.
+## Provider-Specific Specifications
 
-### Architecture
+Provider-specific configuration that sits below the platform abstraction boundary is documented separately:
 
-How components relate to one another, communicate with one another and their boundaries:
-
-* [Data Architecture](specifications/architecture/data_architecture.md)
-
-### API
-
-Components are split up into micro-services with RESTful APIs that can be leveraged by Web browsers, CLI tools etc.
-API specifications document common API conventions that apply across the platform to foster code reuse.
-
-* [API Design](specifications/api/design.md)
-* [API Resource Metadata](specifications/api/resource-metdata.md)
-
-### Security
-
-Top level security concerns are addressed here.
-
-* [Security Model](specifications/security/security-model.md)
-* [Authentication Modes](specifications/identity/authentication_modes.md)
-
-### Workload Identity
-
-* [Identity Principals and Proxies](specifications/identity/principals.md)
-
-### RBAC
-
-Role based access control [RBAC] provides fine-grain permissions for granting access to resources within the platform.
-
-* [Access Control Lists](specifications/rbac/access-control-lists.md)
-
-### User Management
-
-Getting people onto a public cloud platform in a safe and secure manner.
-
-* [User Account Creation](specifications/identity/onboarding.md)
-
-### Quotas
-
-in a finite, multi-tenant deployment, compute hardware needs to be made available to those who are contractually entitled to it.
-Quotas allow resources to be shared in a fair and predictable way.
-They also restrict the damage a rogue actor can cause thus also providing improved quality of service and security guarantees.
-
-* [Quota Management](specifications/quotas/quota-management.md)
-
-### Logging
-
-Logging is more than just for debugging.
-Logging is structured data and can be used as an event source for consumption by external instrumentation, for example for audit logging of resource modification and billing.
-
-* [Audit Logging](specifications/logging/audit-logging.md)
-
-### Providers
-
-We strive to be platform agnostic.
-Although it is primarily written with OpenStack in mind, care has been taken to abstract away platform specific details through architectural descisions.
-Where platform specific configuration and setup is required, or coordination is required between different teams, this linkage is specified here.
-
-#### OpenStack
+### OpenStack
 
 * [Flavor and Image Handling](specifications/providers/openstack/flavors_and_images.md)
 * [External Networks](specifications/providers/openstack/external-networks.md)
