@@ -23,6 +23,7 @@ Nscale Cloud Platform Engineering
    - [4.5 Principal Propagation](#45-principal-propagation)
      - [4.5.1 API Authentication Classifications](#451-api-authentication-classifications)
    - [4.6 Principal Propagation Modes and Impersonation](#46-principal-propagation-modes-and-impersonation)
+     - [4.6.1 ACL Intersection under Impersonation](#acl-intersection-under-impersonation)
 5. [Resource Graph](#5-resource-graph)
    - [5.1 Edge Properties](#51-edge-properties)
    - [5.2 Edge Types by Property Intersection](#52-edge-types-by-property-intersection)
@@ -67,6 +68,7 @@ Nscale Cloud Platform Engineering
    - [9.3 Distributed Tracing](#93-distributed-tracing)
    - [9.4 Metrics](#94-metrics)
 10. [Security](#10-security)
+    - [10.1 Platform Security Invariants](#101-platform-security-invariants)
 11. [Core Library](#11-core-library)
 12. [Glossary](#12-glossary)
 
@@ -190,7 +192,7 @@ A user principal (`X-Principal`) may be propagated on any authenticated service-
 
 **Attribution-only propagation** — `X-Principal` is present; `X-Impersonate` is absent or false. The receiving service records the principal for billing, quota, and audit attribution only. It does not resolve RBAC against the propagated principal. Access decisions are made against the calling service's own mTLS certificate identity. This is the required mode for controllers provisioning resources on behalf of a user, where authorisation was established at the public API boundary and does not need to be re-evaluated on every downstream call.
 
-**Impersonation** — `X-Principal` is present and `X-Impersonate: true` is also set. The receiving service treats the propagated principal as the authoritative actor for RBAC, quota, billing, and audit on that request. Access decisions are made as if the end-user called the service directly. This mode is only appropriate for proxy services presenting a user's identity downstream so that the full access control chain is preserved end-to-end.
+**Impersonation** — `X-Principal` is present and `X-Impersonate: true` is also set. The receiving service treats the propagated principal as the authoritative actor for RBAC, quota, billing, and audit on that request. The effective ACL is the intersection of the user's ACL and the impersonating service's own system account ACL (see [ACL Intersection under Impersonation](#acl-intersection-under-impersonation) below). This mode is only appropriate for proxy services presenting a user's identity downstream so that the full access control chain is preserved end-to-end.
 
 **Rules:**
 
@@ -200,6 +202,28 @@ A user principal (`X-Principal`) may be propagated on any authenticated service-
 - Impersonation (`X-Impersonate: true`) is only appropriate for proxy services. It is not a general-purpose capability.
 - A service must never impersonate another service's identity. The mTLS certificate CN is fixed. Only the user principal context may travel in `X-Principal`.
 - Any service holding a valid platform CA-signed mTLS certificate is trusted to signal impersonation. No additional allowlist of permitted impersonators is maintained. The mTLS trust boundary is the sole control.
+
+#### ACL Intersection under Impersonation
+
+When a system account (mTLS-authenticated service) impersonates an end-user, returning the user's ACL in full creates a confused deputy vulnerability: a user may hold permissions that the impersonating service itself is not authorised to exercise, and a narrowly-scoped proxy service could inadvertently acquire the user's broader administrative rights against the downstream service.
+
+The effective ACL for an impersonated request is therefore the intersection of the user's ACL and the service's own system account ACL.
+
+System accounts accumulate permissions exclusively at global scope. The service's global permissions act as a single allow-list that gates every scope level of the user's ACL. For each `(resource, operation)` tuple in the user's ACL at any scope level, the tuple is retained only if the service's global ACL also contains that `(resource, operation)`. If the service holds no permission for a resource type, all user permissions for that resource are stripped regardless of scope.
+
+The scope hierarchy rule follows from the above:
+
+| User's ACL scope | Service must hold |
+|---|---|
+| project | global (resource, op) |
+| organization | global (resource, op) |
+| global | global (resource, op) |
+
+**Properties of this design:**
+
+- **No privilege escalation** — impersonation can only reduce the user's effective permissions, never expand them.
+- **Principle of least authority** — each service is confined to the subset of the user's permissions that the service itself is authorised for, regardless of the user's own role.
+- **Attribution-only callers unaffected** — services that set `X-Principal` without `X-Impersonate` continue to resolve RBAC against their own system account role only, with no change in behaviour.
 
 ---
 
@@ -644,6 +668,16 @@ The platform enforces three tiers of access control, each with a distinct authen
 | Platform | Cloud provider APIs | Accessed only by the Region service via Kubernetes Secret credentials. |
 
 RBAC as defined in [section 4.3](#43-rbac) is the enforcement mechanism for Public and Service tier access. No principal in any tier may access resources outside their permitted scope as defined by the ACL.
+
+### 10.1 Platform Security Invariants
+
+The following invariants apply unconditionally to all platform components. Any implementation that violates them is a defect, not a design trade-off.
+
+- **No privilege escalation** — no operation may grant a principal more access than they already hold. Impersonation can only narrow a user's effective permissions (via ACL intersection with the service's own ACL); it can never expand them. See [section 4.6.1](#acl-intersection-under-impersonation).
+- **Principle of least authority** — each actor (service or user) operates with only the permissions required for the current operation. Services must not accumulate permissions beyond their functional scope, and must not forward a user's full ACL when acting as a proxy.
+- **Scope confinement** — access granted at a narrower scope (project, organisation) does not implicitly confer access at a broader scope. The scope hierarchy is strictly one-directional: broader grants cover narrower scopes, never the reverse. See [section 4.3](#43-rbac).
+- **Single enforcement point** — all access decisions are made against the ACL returned by the identity service. There is no local policy evaluation in individual services. Duplicating or caching access logic outside the ACL endpoint is a defect.
+- **Immutable attribution** — the principal recorded on a resource at creation time cannot be changed. Re-attribution is not permitted. See [section 4.4](#44-principals-and-proxies).
 
 ---
 
