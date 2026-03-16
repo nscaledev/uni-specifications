@@ -438,7 +438,28 @@ The canonical server setup defines two ordered middleware groups.
 
 ### 7.3 Conflict Detection
 
-All write operations must include a conflict detection mechanism. Conflict detection is implemented by including the resource version in the write request. If the version on the server has advanced since the client last read the resource, the write must be rejected with `409 Conflict`. The caller is then responsible for re-reading and re-applying their change.
+All write operations must include a conflict detection mechanism. Conflict detection is implemented by including the resource version in the write request (`MergeFromWithOptimisticLock`). If the resource version on the server has advanced since the client last read the resource, the write must be rejected with `409 Conflict`. The caller is then responsible for re-reading and re-applying their change.
+
+**Rationale — why the server must not retry internally:**
+Server-side retry after a conflict would silently overwrite a concurrent write. The server does not know whether the new incoming change is still valid against the updated resource state; only the caller does. Surfacing the 409 forces the caller to re-derive its intent from the current state, which is the only safe approach under concurrent writes.
+
+**OpenAPI requirement:**
+Whether a `409` must be advertised depends on whether the operation can actually produce a conflict:
+
+- **All PUT (update) endpoints** must include `409`. Section 7.2 mandates `MergeFromWithOptimisticLock` for every update; since Kubernetes will raise `IsConflict` whenever the resource version has advanced, a conflict is always a possible outcome regardless of traffic patterns.
+- **POST endpoints that patch an existing resource** (e.g. rotate operations that call `MergeFromWithOptimisticLock`) must include `409` for the same reason.
+- **POST endpoints that create a new resource** should include `409` if the handler enforces name or uniqueness constraints that can produce a duplicate (the "already exists" flavour of conflict). If no such check exists, omitting `409` is acceptable and more accurate.
+
+All `409` responses must reference the canonical `conflictResponse` component from the core spec.
+
+**Client-side contract:**
+
+| Caller type | Required behaviour |
+|---|---|
+| Controller (internal) | Treat as transient. Return `ErrYield` to requeue with a fixed timeout. Re-read the resource before the next reconcile pass. See [section 8.7](#87-downstream-error-handling). |
+| Service-to-service handler | Re-read the target resource and re-apply the change within the same request. If a second conflict occurs, return `409` to the upstream caller rather than looping. |
+| UI / interactive client | Do not auto-retry silently. Inform the user that their change conflicted with a concurrent modification and prompt them to reload before retrying. Auto-retry risks overwriting a change the user has not seen. |
+| SDK / programmatic client | Re-read the resource, re-derive the change from the fresh state, and retry once. If the conflict recurs, surface the error to the caller. |
 
 ### 7.4 Resource References
 
