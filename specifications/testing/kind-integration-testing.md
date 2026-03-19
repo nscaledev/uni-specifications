@@ -22,7 +22,7 @@ tooling. This has several consequences:
 | v0.1 | Platform Engineering | 2026-03 | Initial draft |
 | v0.2 | Platform Engineering | 2026-03 | Reflect `hack/ci/` layout; go.mod-pinned infra deps; setup-infra/install separation; ingress-nginx via Helm |
 | v0.3 | Platform Engineering | 2026-03 | Reflect implemented state: mTLS auth model, two-principal RBAC matrix, protected role constraint, fixtures via OpenAPI client |
-| v0.4 | Platform Engineering | 2026-03 | Fixtures as ecosystem primitive; self-contained test suites; full coverage fixture topology (multi-org, multi-project, all role scopes, isolation axes) |
+| v0.4 | Platform Engineering | 2026-03 | Align with implemented state: single-org/single-project fixture topology (admin + user principals); Colima as first-class alternative to KinD; correct developer workflow |
 
 ## Design Principles
 
@@ -41,26 +41,7 @@ This approach ensures the fixture creation path exercises the same API surface a
 mTLS back-channel provides the privileged access needed to bootstrap resources without relying on
 any pre-existing bearer token.
 
-**2a. Fixtures are a composable ecosystem primitive.**
-`hack/ci/fixtures` is not only used by identity's own test suite — it is the authoritative source
-of identity primitives for the entire platform. Downstream services (region, compute, kubernetes)
-call it to obtain a working set of organisations, projects, groups, and service account tokens
-before running their own tests. Its output contract is therefore as stable and intentional as
-`hack/ci/install`.
-
-The fixture topology is deliberately rich (see [Fixture Topology](#fixture-topology)) so that any
-consumer can exercise org isolation, project isolation, and every role scope without creating
-additional identity resources themselves.
-
-**2b. Each service's test suite is self-contained.**
-While `hack/ci/fixtures` provides the shared ecosystem bootstrap, each service's own Ginkgo suite
-must not depend on a pre-populated `test/.env` file produced by an external step. The suite
-creates everything it needs in `BeforeSuite` and destroys it in `AfterSuite`. The fixture
-creation logic lives in a reusable Go package (e.g. `pkg/testing/fixtures`) that both the
-`hack/ci/fixtures` CLI and `BeforeSuite` import — one implementation, two consumers, no
-duplication.
-
-**3. The composable install and fixtures model.**
+**3. The composable install model.**
 Each service defines a single install unit (`hack/ci/install`) that knows how to deploy that
 service into a running cluster. All CI-related scripts live under `hack/ci/` in each service
 repo. Install units are:
@@ -80,24 +61,13 @@ duplication.
 ```
 # Identity CI:
 hack/ci/setup-infra
-hack/ci/install   --namespace unikorn-identity-$RAND --release-name identity-$RAND > identity.env
-. identity.env
-hack/ci/fixtures  --base-url "$IDENTITY_BASE_URL" --namespace "$IDENTITY_NAMESPACE" \
-                  --ca-cert "$IDENTITY_CA_CERT" > identity-fixtures.env
+hack/ci/install --namespace unikorn-identity-$RAND --release-name identity-$RAND
 
 # Compute CI (when it needs identity and region as dependencies):
 hack/ci/setup-infra                   # idempotent — safe to call at the top of any CI run
-../identity/hack/ci/install   --namespace unikorn-identity-$RAND --release-name identity-$RAND \
-                               > identity.env
-. identity.env
-../identity/hack/ci/fixtures  --base-url "$IDENTITY_BASE_URL" --namespace "$IDENTITY_NAMESPACE" \
-                               --ca-cert "$IDENTITY_CA_CERT" > identity-fixtures.env
-. identity-fixtures.env
-../region/hack/ci/install     --namespace unikorn-region-$RAND --release-name region-$RAND \
-                               > region.env
-. region.env
-hack/ci/install               --namespace unikorn-compute-$RAND --release-name compute-$RAND
-# compute's own BeforeSuite uses identity-fixtures.env tokens to authenticate
+../identity/hack/ci/install --namespace unikorn-identity-$RAND --release-name identity-$RAND
+../region/hack/ci/install   --namespace unikorn-region-$RAND   --release-name region-$RAND
+hack/ci/install             --namespace unikorn-compute-$RAND  --release-name compute-$RAND
 ```
 
 **4. go.mod as version source of truth.**
@@ -145,11 +115,19 @@ These are installed by `hack/ci/setup-infra`, which is called as an explicit ste
 service install. Because it is idempotent, higher-level service CIs can call it at the start of
 their run without duplication or conflict.
 
-**ingress-nginx** is installed from the official `ingress-nginx/ingress-nginx` Helm chart. When
-the cluster is detected as KinD (kubectl context matches `kind-*`), additional values are applied
-to enable hostPort mode and NodePort service type, so that KinD's `extraPortMappings` route
-host ports 80/443 to the nginx controller. On non-KinD clusters these overrides are omitted and
-the chart uses its defaults.
+### Cluster type support
+
+`hack/ci/setup-infra` and `hack/ci/install` both detect the current kubectl context:
+
+| Context prefix | Cluster type | Image loading |
+|----------------|-------------|---------------|
+| `kind-*` | KinD | `make images-kind-load` (build + `kind load`) |
+| `colima` / `colima-*` | Colima | `make images` (build only; images are immediately available in the VM) |
+| anything else | Remote/cloud | No build; images pulled from registry |
+
+KinD-specific ingress-nginx values (hostPort mode, NodePort service type, control-plane
+tolerations) are applied only when the context is `kind-*`. On Colima or cloud clusters the
+chart uses its defaults, relying on the cluster's own ingress or load-balancer provisioner.
 
 **unikorn-core** creates the `unikorn-issuer` and `unikorn-client-issuer` ClusterIssuers via its
 own Helm chart. `setup-infra` resolves the module via `go list -m -f '{{.Dir}}'`, copies it to
@@ -199,18 +177,18 @@ authenticate against during testing. The bootstrap sequence is:
 1. A system account (`ci-fixtures`) is pre-configured in the identity Helm release via
    `hack/ci/test-values.yaml` (passed as `--values` to `hack/ci/install`). System accounts
    authenticate via mTLS client certificates; the certificate CN maps directly to an RBAC role.
-2. `hack/ci/fixtures` (or `BeforeSuite` via the shared fixtures package) issues a short-lived
-   mTLS client certificate for `ci-fixtures` from the `unikorn-client-issuer` ClusterIssuer
-   using cert-manager's `Certificate` CRD, via `controller-runtime` (no `kubectl` shell-outs).
+2. `hack/ci/fixtures` issues a short-lived mTLS client certificate for `ci-fixtures` from the
+   `unikorn-client-issuer` ClusterIssuer using cert-manager's `Certificate` CRD, via
+   `controller-runtime` (no `kubectl` shell-outs).
 3. It calls the identity HTTP API using the generated `openapi.ClientWithResponses` client over
    mTLS. Every request carries an `X-Principal` header (base64url-encoded JSON of the principal
    struct) as required by the middleware.
-4. It creates the full fixture topology (see below): two organisations, each with two projects,
-   each with groups covering all role scopes, plus an unaffiliated service account.
-5. When invoked as `hack/ci/fixtures`, the resulting bearer tokens and resource IDs are written
-   as a `.env` fragment to stdout and sourced by downstream CI. When invoked from `BeforeSuite`,
-   they are stored in suite-level variables — no file is written.
-6. All HTTP API test calls use these bearer tokens.
+4. It creates: `Organization` → waits for org-controller to provision the backing namespace →
+   lists roles → creates two `Group` resources → creates a `Project` → creates two
+   `ServiceAccount` resources.
+5. The resulting bearer tokens and resource IDs are written to `test/.env` and loaded by the
+   Ginkgo test suite.
+6. All HTTP API test calls in the e2e suite use these bearer tokens.
 
 ### mTLS authentication model
 
@@ -247,64 +225,20 @@ The public non-protected roles (assignable via the API) are:
 and `user` to the user test group. The `platform-administrator` role is granted to `ci-fixtures`
 via Helm values and is used only for the mTLS bootstrap step.
 
-## Fixture Topology
-
-The fixture set is designed to cover every meaningful scoping and isolation dimension in a single
-pass. Downstream consumers can rely on these resources existing and use the exported tokens
-directly without creating additional identity primitives.
-
-```
-Organisation 1  (TEST_ORG1_ID)
-  ├── Project 1  (TEST_PROJECT1_ID)
-  │    ├── admin-group    → administrator role  → ci-admin-sa    → ADMIN_TOKEN
-  │    ├── user-group     → user role           → ci-user-sa     → USER_TOKEN
-  │    ├── reader-group   → reader role         → ci-reader-sa   → READER_TOKEN
-  │    └── auditor-group  → auditor role        → ci-auditor-sa  → AUDITOR_TOKEN
-  └── Project 2  (TEST_PROJECT2_ID)
-       └── user-group     → user role           → ci-p2-user-sa  → PROJECT2_USER_TOKEN
-
-Organisation 2  (TEST_ORG2_ID)
-  └── Project 1  (TEST_ORG2_PROJECT1_ID)
-       └── admin-group    → administrator role  → ci-org2-admin-sa → ORG2_ADMIN_TOKEN
-
-(no organisation)
-  └── ci-unaffiliated-sa  (no group membership) → UNAFFILIATED_TOKEN
-```
-
-### What each principal tests
-
-| Token | Scope | Tests |
-|-------|-------|-------|
-| `ADMIN_TOKEN` | Org 1, org-scoped | Full CRUD on all org 1 identity resources; the workhorse for downstream test setup |
-| `USER_TOKEN` | Org 1, Project 1 | Project-scoped access; 403 on org-admin endpoints |
-| `READER_TOKEN` | Org 1, Project 1 | Read-only at project scope; 403 on any write |
-| `AUDITOR_TOKEN` | Org 1, org-scoped read-only | Read-only across org; 403 on any write |
-| `PROJECT2_USER_TOKEN` | Org 1, Project 2 | Project isolation — cannot see Project 1 resources |
-| `ORG2_ADMIN_TOKEN` | Org 2, org-scoped | Org isolation — cannot see Org 1 resources |
-| `UNAFFILIATED_TOKEN` | None | Hard denial — 403 on every authenticated endpoint |
-
-### Coverage axes
-
-- **Permission level**: administrator, auditor, user, reader — all four built-in scopes
-- **Org isolation**: `ORG2_ADMIN_TOKEN` must not see Org 1's resources and vice versa
-- **Project isolation**: `PROJECT2_USER_TOKEN` must not see Project 1's resources
-- **Hard denial**: `UNAFFILIATED_TOKEN` is authenticated but has no permissions anywhere
-- **Data-level filtering**: `USER_TOKEN` on `GET /serviceaccounts` returns 200 but only its own
-  record — tests must distinguish endpoint-level denial (403) from data-level filtering (200 with
-  reduced result set)
-
-### Downstream role layering
-
-Downstream services define their own roles (e.g. `kubernetes:clusters:read`). These are assigned
-to the groups already present in the fixture topology — no new groups or service accounts need to
-be created. The administrator group in Project 1 is the natural target for downstream admin roles;
-the user group for standard access.
-
 ## RBAC Matrix Testing
 
-The RBAC permission matrix is tested systematically at the HTTP level. Tests are structured as
-Ginkgo `DescribeTable` entries with one row per endpoint, covering all principals from the fixture
-topology that are relevant to the endpoint's access control.
+The RBAC permission matrix is tested systematically at the HTTP level using two principals:
+
+| Principal | Role | Token variable |
+|-----------|------|---------------|
+| `ci-admin-sa` | `administrator` (org-scoped) | `ADMIN_AUTH_TOKEN` |
+| `ci-user-sa` | `user` (project-scoped) | `USER_AUTH_TOKEN` |
+
+Tests are structured as Ginkgo `DescribeTable` entries:
+
+- **`administrator` table** — expects 200 on all org-level identity read endpoints
+- **`user` denied table** — expects 403 on org-admin endpoints the user role has no access to
+- **`user` self-view table** — expects 200 on service account list (server filters to own record)
 
 The endpoint list is currently hand-maintained in `test/e2e/rbac_matrix_test.go`. When a new
 endpoint is added, a corresponding entry must be added to the relevant table(s).
@@ -320,16 +254,13 @@ reduced result set).
 ## Developer Workflow
 
 ```sh
-# One-time local setup — KinD:
+# One-time local setup (creates cluster, installs infra):
 make kind-cluster kind-infra
 
-# One-time local setup — Colima (Mac):
-colima start --kubernetes && make kind-infra
+# Deploy and test (uses random release name/namespace each time):
+make kind-install kind-fixtures test-e2e-ci
 
-# Deploy and test (random release name/namespace; suite is self-contained):
-make kind-install test-e2e-ci
-
-# Or all at once (KinD only):
+# Or all at once:
 make kind-test
 
 # Re-run tests without redeploying:
@@ -338,16 +269,8 @@ make test-e2e
 # Focus on a specific test during development:
 make test-e2e-focus FOCUS="administrator"
 
-# Reuse an existing deployment (pin the suffix):
-KIND_SUFFIX=abc12345 make test-e2e-ci
-
-# Run fixtures standalone (for downstream service CI):
-. test/.env.install
-go run ./hack/ci/fixtures/... \
-  --base-url "$IDENTITY_BASE_URL" \
-  --namespace "$IDENTITY_NAMESPACE" \
-  --ca-cert "$IDENTITY_CA_CERT" \
-  > identity-fixtures.env
+# Reuse an existing deployment (re-run fixtures against the last install):
+make kind-fixtures test-e2e-ci
 ```
 
 The default KinD cluster name is `identity-test` (not `kind`) to avoid interfering with a
@@ -363,6 +286,3 @@ including prerequisites, troubleshooting steps, and the pre-PR checklist.
   (unikorn-core is already pinned via go.mod; cert-manager and ingress-nginx are unpinned today.)
 - Should the RBAC expected-outcomes table be driven from the OpenAPI spec automatically, so that
   new endpoints cause test failures rather than silent omissions?
-- Should downstream services assign their roles to the shared fixture groups, or create their own
-  groups within the fixture orgs/projects? The former keeps the token set stable; the latter gives
-  each service full isolation of its own role assignments.
