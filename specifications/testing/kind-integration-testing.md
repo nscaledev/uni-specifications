@@ -269,8 +269,8 @@ make test-e2e
 # Focus on a specific test during development:
 make test-e2e-focus FOCUS="administrator"
 
-# Reuse an existing deployment (re-run fixtures against the last install):
-make kind-fixtures test-e2e-ci
+# Reuse an existing deployment (pin the suffix):
+KIND_SUFFIX=abc12345 make kind-fixtures test-e2e-ci
 ```
 
 The default KinD cluster name is `identity-test` (not `kind`) to avoid interfering with a
