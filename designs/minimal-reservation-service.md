@@ -22,6 +22,10 @@ The `Reservation` CRD is internal to the reservation service. Its schema uses Op
 type ReservationSpec struct {
     // Region in which to allocate a host
     RegionID string
+    // VPC (Network) this Reservation is associated with.
+    // External services (e.g. ib-manager) use this to determine which
+    // partition or network resource to program for the reserved host.
+    NetworkID string
     // Flavour determining which class of host to select
     FlavorID string
     // Condition types that must be True before this Reservation is usable.
@@ -165,6 +169,7 @@ All calls use mTLS; the caller's service account certificate is its identity.
 
 The region service creates a Reservation when a Network is provisioned in an IB-capable region (or more generally, whenever the Region's `Spec.ReadinessGates` is non-empty). The Reservation is created with:
 - `RegionID` from the Network's region
+- `NetworkID` from the Network being provisioned
 - `FlavorID` from the intended Server flavour
 - `ReadinessGates` copied verbatim from `Region.Spec.ReadinessGates`
 
@@ -200,13 +205,14 @@ In the minimal service, one Reservation is consumed by at most one Server. The r
 ib-manager subscribes to Reservation lifecycle events via the Kubernetes event bus (informer on the Reservation CRD). The envelope carries `ResourceID` and `DeletionTimestamp`.
 
 **On creation (DeletionTimestamp nil):**
-1. `GET /reservations/{id}` — fetch full state including `Status.HostIDs`
+1. `GET /reservations/{id}` — fetch full state including `Spec.NetworkID` and `Status.HostIDs`
 2. Fetch flavour via region service REST API → `FlavorInfiniBandSpec.PortCount`
-3. If `PortCount == 0`: `PUT /reservations/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True — done
-4. For each host in `Status.HostIDs`, query Ironic for IB port GUIDs
-5. Program UFM partition
-6. `POST /reservations/{id}/references` — register deletion block
-7. `PUT /reservations/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True
+3. If `PortCount == 0`: set `ib.unikorn-cloud.org/partition-ready` True — done
+4. Look up the `IBPartition` for `Spec.NetworkID`
+5. For each host in `Status.HostIDs`, query Ironic for IB port GUIDs
+6. Program UFM partition (add GUIDs to the `IBPartition`)
+7. Register deletion block on the Reservation
+8. Set `ib.unikorn-cloud.org/partition-ready` True on the Reservation
 
 **On deletion (DeletionTimestamp non-nil):**
 1. `GET /reservations/{id}` — fetch current state
@@ -233,6 +239,14 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 - Host selection logic generalises from "pick one" to "pick N"
 - Resource reference and gate mechanisms are unchanged
 - Further expansion to rack-level reservations would add a `Spec.Topology` field describing the grouping constraint (e.g. all hosts on the same top-of-rack switch)
+
+---
+
+## Decision Log
+
+| Date | Decision | Rationale |
+|---|---|---|
+| 2026-04-01 | `Spec.NetworkID` carried on Reservation | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Reservation self-describing. |
 
 ---
 
