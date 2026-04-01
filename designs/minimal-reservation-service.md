@@ -250,6 +250,40 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 
 ---
 
+## Service Placement
+
+Two deployment options exist. The choice has not yet been made.
+
+### Option A: Embedded in the Region Service
+
+The reservation controller and handler live inside `uni-region`. The `Reservation` CRD belongs to the region service API group.
+
+**Advantages:**
+- Host selection can use internal region service state directly — flavour-to-resource-class mapping, Ironic client, and existing host inventory are all in-process. No new endpoints needed.
+- One less service to deploy and operate.
+- The Reservation is a natural extension of region concepts (flavours, hosts, aggregates).
+
+**Disadvantages:**
+- The region service grows larger. Reservation lifecycle (host selection, aggregate management, gate coordination) is a distinct concern from network and identity management.
+- All consumers (ib-manager, future gate services) already call the region service; adding reservation endpoints there conflates two separate responsibilities.
+
+### Option B: Separate Service (`uni-reservation`)
+
+The reservation service is a standalone binary with its own CRDs, API, and deployment.
+
+**Advantages:**
+- Clean separation of concerns. The reservation service owns host pre-allocation; the region service owns networks and identities.
+- Independently deployable and scalable.
+- The service boundary makes the gate protocol explicit — ib-manager calls `uni-reservation`, not `uni-region`.
+
+**Disadvantages:**
+- Host selection requires knowing which Ironic nodes are available for a given flavour. This state currently lives in the region service. A separate service would need either:
+  - A new region service endpoint — "list available hosts for flavour X" — which does not exist today, or
+  - Its own Ironic credentials and flavour-to-resource-class mapping logic, duplicating region service internals.
+- Additional operational complexity: new deployment, new mTLS certificate, new RBAC role.
+
+---
+
 ## Open Questions
 
 1. **Host selection race:** The minimal service accepts a best-effort selection with no distributed lock. Is this acceptable for the target deployment, or does the host pool turn over fast enough that races are a real concern?
@@ -259,3 +293,5 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 3. **Flavour-to-resource-class mapping:** Host selection requires mapping `FlavorID` to an Ironic resource class. The mechanism for this lookup (via region service, directly from Nova, or via a local cache) is not yet specified.
 
 4. **Reservation ownership:** Who owns the lifecycle of a Reservation — is it created and deleted by the region service on behalf of a user, or is it a user-visible resource? For the minimal service, treating it as an internal implementation detail of the region service (not directly user-facing) is simplest.
+
+5. **Service placement:** Should the reservation service be embedded in `uni-region` (Option A) or deployed as a separate service `uni-reservation` (Option B)? See the Service Placement section. The deciding factor is likely host selection: if a "list available hosts for flavour" endpoint can be added to the region service, Option B becomes more viable. If not, Option A avoids duplicating Ironic and flavour-mapping logic.
