@@ -48,10 +48,11 @@ type OpenStackReservationStatus struct {
 ```
 
 **Conditions:**
-- `Ready` — set True by the controller once the aggregate is created and hosts are assigned. This is the controller's own health signal, separate from the readiness gates.
-- Gate conditions (e.g. `ib.unikorn-cloud.org/partition-ready`) — set by external services via the REST API. The region service waits for all conditions named in `Spec.ReadinessGates` to be True before using this Reservation as a scheduler hint.
+- `Allocated` — set True by the controller once hosts have been selected and the Nova aggregate created. This is the controller's own signal that the Reservation has been populated.
+- Gate conditions (e.g. `ib.unikorn-cloud.org/partition-ready`) — set by external services via the REST API, as named in `Spec.ReadinessGates`.
+- `Ready` — set True by the controller only when `Allocated` is True and every condition named in `Spec.ReadinessGates` is also True.
 
-A Reservation is usable when both `Ready == True` and all `Spec.ReadinessGates` conditions are True.
+Consumers (e.g. the Server provisioner) wait only for `Ready == True`. They do not inspect individual gate conditions — that aggregation is the controller's responsibility.
 
 ### Controller
 
@@ -70,7 +71,11 @@ On creation (DeletionTimestamp nil):
 3. Record in status
        Status.AggregateID = aggregate UUID
        Status.HostIDs = [ironic node UUID]
-       Set Ready condition True
+       Set Allocated condition True
+
+4. Recompute Ready
+       If Allocated == True and all Spec.ReadinessGates conditions are True:
+           Set Ready condition True
 ```
 
 On deletion (DeletionTimestamp non-nil):
@@ -178,11 +183,10 @@ The region service creates a Reservation when a Network is provisioned in an IB-
 Region service creates Server
 
     1. Fetch Reservation via reservation service REST API
-    2. Check Ready == True (aggregate created, host assigned)
-    3. Check all Spec.ReadinessGates conditions are True
-           If any are False or missing: Server stays pending, requeue
+    2. Check Ready == True
+           If False or absent: Server stays pending, requeue
 
-    4. All gates satisfied:
+    3. Ready == True:
            Read Status.AggregateID from Reservation
            POST /compute/v2/servers with scheduler hint:
                os:scheduler_hints:
@@ -212,6 +216,7 @@ ib-manager subscribes to Reservation lifecycle events via the Kubernetes event b
 6. Program UFM partition (add GUIDs to the `IBPartition`)
 7. `PUT /reservations/{id}/references/{ref}` — register deletion block
 8. `PUT /reservations/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True
+   → reservation service controller requeues, recomputes Ready
 
 **On deletion (DeletionTimestamp non-nil):**
 1. `GET /reservations/{id}` — fetch current state
