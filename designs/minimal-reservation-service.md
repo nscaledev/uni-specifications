@@ -95,13 +95,29 @@ The controller adds its own finalizer on creation to ensure the deletion path ru
 
 ### Host Selection
 
-A host is considered available if:
-- Its Ironic provision state is `available`
-- It is not in maintenance
-- Its resource class matches the requested flavour
-- Its Ironic node UUID does not appear in `Status.HostIDs` of any other active (non-deleting) Reservation in the same region
+The controller queries the OpenStack Placement API to find available hosts. Each Ironic node is a resource provider in Placement, with its UUID matching the Ironic node UUID. A bare metal node exposes one unit of a single custom resource class derived from its `resource_class` field (e.g. `baremetal-large` → `CUSTOM_BAREMETAL_LARGE`).
 
-Host selection is best-effort at creation time. If no host is available, the controller sets a condition (`HostUnavailable`) and requeues. It does not hold a lock between selection and aggregate creation — in the unlikely event of a race, the duplicate will be caught when the second reservation attempts to programme the same host (e.g. ib-manager will error on a conflicting GUID). The minimal service accepts this: single-host reservations with human-driven scheduling make races rare in practice.
+**Step 1 — Resolve the resource class from the flavour.**
+The flavour's extra specs contain `resources:CUSTOM_BAREMETAL_LARGE=1` (or equivalent). The controller queries Nova for the flavour and reads the `resources:CUSTOM_*` key to obtain the resource class name. No separate mapping is needed.
+
+**Step 2 — Query Placement for available hosts.**
+
+```
+GET /placement/resource_providers?resources=CUSTOM_BAREMETAL_LARGE:1
+```
+
+This returns only resource providers with free capacity — i.e. nodes registered in Placement with no existing allocation. This is the correct source of truth because:
+- A node being deployed by Nova is already marked consumed in Placement, even though its Ironic provision state is still `deploying`. Querying Ironic alone would incorrectly consider it available.
+- Placement's inventory is authoritative for Nova scheduling; using it for host selection aligns the reservation service's view with the scheduler's view.
+
+**Step 3 — Cross-check against Ironic.**
+Placement has a ~60-second sync lag from Ironic. To guard against stale data, each candidate returned by Placement is checked directly against Ironic:
+- `provision_state == available`
+- `maintenance == false`
+
+A host passing both checks is selected.
+
+If no host is available, the controller sets an `HostUnavailable` condition and requeues. Host selection is best-effort with no distributed lock — in the event of a race between two concurrent Reservations selecting the same host, the aggregate creation for one will succeed and ib-manager will catch the conflict on the other when it attempts to programme the same GUIDs. The minimal service accepts this: single-host reservations with human-driven scheduling make races rare in practice.
 
 ### Resource References
 
@@ -253,6 +269,7 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 | 2026-04-01 | `Spec.NetworkID` carried on Reservation | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Reservation self-describing. |
 | 2026-04-01 | Deletion blocking via reference REST API, not direct finalizer writes | Per platform spec section 5.3, external services never write another service's finalizers directly. The reservation service exposes canonical `PUT`/`DELETE` reference endpoints and manages finalizers internally. |
 | 2026-04-01 | CRD named `OpenStackReservation` | The CRD is OpenStack-specific (Nova aggregates, Ironic node UUIDs). Making the provider explicit in the type name is consistent with the design's stated principle of no provider abstraction, and avoids naming conflicts if other provider types are added later. |
+| 2026-04-01 | Host selection via Placement API, cross-checked against Ironic | `GET /placement/resource_providers?resources=<class>:1` gives a more accurate availability view than querying Ironic directly — it reflects Nova allocations for nodes mid-deploy. Resource class is resolved from the flavour's `resources:CUSTOM_*` extra spec. Ironic is still checked to guard against Placement's ~60s sync lag. |
 
 ---
 
@@ -340,7 +357,7 @@ The reservation service is a standalone binary with its own CRDs, API, and deplo
 
 2. **Aggregate scheduler hint mechanism:** The design uses `aggregate_instance_extra_specs` with a `unikorn-reservation` metadata key on the aggregate, requiring `AggregateInstanceExtraSpecsFilter` in Nova's scheduler filter list. This needs to be confirmed as enabled in the target deployment.
 
-3. **Flavour-to-resource-class mapping:** Host selection requires mapping `FlavorID` to an Ironic resource class. The mechanism for this lookup (via region service, directly from Nova, or via a local cache) is not yet specified.
+3. ~~**Flavour-to-resource-class mapping:**~~ Resolved — the resource class is read directly from the flavour's `resources:CUSTOM_*` extra spec. No separate mapping needed.
 
 4. **Reservation ownership:** Who owns the lifecycle of a Reservation — is it created and deleted by the region service on behalf of a user, or is it a user-visible resource? For the minimal service, treating it as an internal implementation detail of the region service (not directly user-facing) is simplest.
 
