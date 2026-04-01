@@ -14,12 +14,12 @@ The reservation service pre-allocates bare metal hosts for a VPC before any serv
 
 ## Design
 
-### CRD: `Reservation`
+### CRD: `OpenStackReservation`
 
-The `Reservation` CRD is internal to the reservation service. Its schema uses OpenStack terminology directly — there is no provider abstraction.
+The `OpenStackReservation` CRD is internal to the reservation service. Its schema uses OpenStack terminology directly — there is no provider abstraction.
 
 ```go
-type ReservationSpec struct {
+type OpenStackReservationSpec struct {
     // Region in which to allocate a host
     RegionID string
     // VPC (Network) this Reservation is associated with.
@@ -33,7 +33,7 @@ type ReservationSpec struct {
     ReadinessGates []string
 }
 
-type ReservationStatus struct {
+type OpenStackReservationStatus struct {
     // Nova host aggregate UUID created for this Reservation
     AggregateID string
     // Ironic node UUIDs of the hosts assigned to this Reservation.
@@ -247,6 +247,7 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 |---|---|---|
 | 2026-04-01 | `Spec.NetworkID` carried on Reservation | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Reservation self-describing. |
 | 2026-04-01 | Deletion blocking via reference REST API, not direct finalizer writes | Per platform spec section 5.3, external services never write another service's finalizers directly. The reservation service exposes canonical `PUT`/`DELETE` reference endpoints and manages finalizers internally. |
+| 2026-04-01 | CRD named `OpenStackReservation` | The CRD is OpenStack-specific (Nova aggregates, Ironic node UUIDs). Making the provider explicit in the type name is consistent with the design's stated principle of no provider abstraction, and avoids naming conflicts if other provider types are added later. |
 
 ---
 
