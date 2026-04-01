@@ -250,6 +250,50 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 
 ---
 
+## Migration
+
+The current system boots servers directly via Nova with no pre-placement, no Reservations, and no readiness gates. The migration must be non-breaking for existing regions and existing servers.
+
+### Existing regions — no change required
+
+`Region.Spec.ReadinessGates` is a new optional field that defaults to empty. An empty gate list means no gates are required before a Reservation is used as a scheduler hint — and with no Reservation in the boot path at all, existing regions behave exactly as before. No operator action is needed for regions that do not have an IB fabric.
+
+### New IB-capable regions — opt-in by operator
+
+A region with an IB fabric is configured with `ib.unikorn-cloud.org/partition-ready` in `Region.Spec.ReadinessGates` at deploy time. Only these regions use Reservations and gate-based pre-boot coordination. Enabling ib-manager for a region is a single operator change to the Region definition; no flavour updates or server changes are needed.
+
+### Existing servers — no backfill
+
+Servers already running have no associated Reservation. They do not need one: IB partitions for running servers were never programmed (there was no ib-manager), and retrofitting a Reservation to a running server would not change the hardware state. The Server provisioner must handle both cases:
+
+- **No Reservation reference on the Server:** use the existing direct Nova placement path (current behaviour, unchanged).
+- **Reservation reference present:** check all gates, then boot with the aggregate scheduler hint.
+
+This conditional is the only place in the codebase where the old and new paths diverge. Existing servers continue to work without modification.
+
+### Schema changes are additive
+
+All CRD changes introduced by this design are additive optional fields:
+
+| Resource | New field | Default | Impact on existing resources |
+|---|---|---|---|
+| `Region` | `Spec.ReadinessGates []string` | `[]` (empty) | None — existing Regions have no gates |
+| `Reservation` | Entire new CRD | — | None — no existing Reservations |
+| `Flavor` | `Spec.InfiniBand.PortCount int` | `0` | None — existing Flavours have zero IB ports |
+
+No data migration is required. Existing resources are valid under the new schema without modification.
+
+### Rollout order
+
+1. Deploy the updated region service with `Region.Spec.ReadinessGates` support and the conditional Server provisioner path.
+2. Deploy the reservation service (or activate it within `uni-region` depending on the placement decision).
+3. Deploy ib-manager.
+4. For each IB-capable region, add `ib.unikorn-cloud.org/partition-ready` to `Region.Spec.ReadinessGates`.
+
+Steps 1–3 have no user-visible effect. Step 4 activates the new path for that region only.
+
+---
+
 ## Service Placement
 
 Two deployment options exist. The choice has not yet been made.
