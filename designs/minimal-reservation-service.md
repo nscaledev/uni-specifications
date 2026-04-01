@@ -40,9 +40,6 @@ type ReservationStatus struct {
     // Set by the controller after host selection; read by external services
     // (e.g. ib-manager) to discover which hosts to program.
     HostIDs []string
-    // Services that have registered a deletion block on this Reservation.
-    // The Reservation cannot be deleted while this list is non-empty.
-    ResourceReferences []string
     // Standard Kubernetes conditions.
     // Includes the controller-owned Ready condition and any gate conditions
     // set by external services.
@@ -79,15 +76,17 @@ On creation (DeletionTimestamp nil):
 On deletion (DeletionTimestamp non-nil):
 
 ```
-1. If Status.ResourceReferences is non-empty: requeue, do not proceed
+1. If GetResourceReferences() is non-empty: requeue, do not proceed
+   (inbound references signal that a dependent service has not yet
+   reversed its programming)
 
 2. Delete Nova host aggregate
        DELETE /compute/v2/os-aggregates/{id}
 
-3. Remove finalizer — Reservation is deleted
+3. Remove controller finalizer — Reservation is deleted
 ```
 
-The controller adds a finalizer on creation to ensure the deletion path runs before the object is removed from etcd.
+The controller adds its own finalizer on creation to ensure the deletion path runs before the object is removed from etcd.
 
 ### Host Selection
 
@@ -103,24 +102,24 @@ Host selection is best-effort at creation time. If no host is available, the con
 
 External services that perform per-host programming register a deletion block on the Reservation while their programming is active. This prevents the aggregate from being torn down before the programming is reversed.
 
-The mechanism is a named entry in `Status.ResourceReferences`. The reservation service owns all writes to its own CRDs; external services add and remove references via the REST API.
+Per the platform spec (section 5.3), references cross service boundaries via the owning service's reference REST API — external services never write another service's finalizers directly. The reservation service exposes `PUT` and `DELETE` reference endpoints; internally it translates these into finalizer operations on its own CRD. The reference string format follows the canonical `{resource}.{group}/{uuid}` scheme produced by `GenerateResourceReference`.
 
 **Lifecycle:**
 
 ```
 ib-manager programs IB partition
-    → POST .../reservations/{id}/references  body: {"name": "ib-manager"}
-    → reservation service appends "ib-manager" to Status.ResourceReferences
+    → PUT .../reservations/{id}/references/{ref}
+    → reservation service adds finalizer to Reservation CRD
 
 Reservation deleted (DeletionTimestamp set)
-    → controller sees ResourceReferences non-empty, blocks
+    → controller sees inbound reference via GetResourceReferences(), requeues
 
 ib-manager receives deletion event, reverses UFM programming
-    → DELETE .../reservations/{id}/references/ib-manager
-    → reservation service removes "ib-manager" from Status.ResourceReferences
+    → DELETE .../reservations/{id}/references/{ref}
+    → reservation service removes finalizer from Reservation CRD
 
-ResourceReferences now empty
-    → controller proceeds: deletes aggregate, removes finalizer
+No references remain
+    → controller proceeds: deletes aggregate, removes its own finalizer
 ```
 
 ### Deletion Protocol
@@ -134,13 +133,13 @@ User deletes Reservation
 Event bus fires → external services receive deletion notification
     ib-manager:
         Removes host GUIDs from UFM partition
-        DELETE .../reservations/{id}/references/ib-manager
+        DELETE .../reservations/{id}/references/{ref}
 
 Reservation controller (requeued):
-    ResourceReferences empty?
-        No  → requeue
-        Yes → DELETE Nova aggregate
-              Remove finalizer
+    GetResourceReferences() non-empty?
+        Yes → requeue
+        No  → DELETE Nova aggregate
+              Remove controller finalizer
               Reservation removed from etcd
 ```
 
@@ -156,8 +155,8 @@ All endpoints are called by external services (region service, ib-manager). The 
 | `GET` | `/reservations/{id}` | Region service, ib-manager | Read full Reservation state (host list, aggregate ID, conditions) |
 | `DELETE` | `/reservations/{id}` | Region service | Delete a Reservation |
 | `PUT` | `/reservations/{id}/conditions/{type}` | ib-manager | Set a named condition (e.g. `ib.unikorn-cloud.org/partition-ready: True`) |
-| `POST` | `/reservations/{id}/references` | ib-manager | Register a deletion block |
-| `DELETE` | `/reservations/{id}/references/{name}` | ib-manager | Release a deletion block |
+| `PUT` | `/reservations/{id}/references/{name}` | ib-manager | Register a deletion block (idempotent) |
+| `DELETE` | `/reservations/{id}/references/{name}` | ib-manager | Release a deletion block (idempotent) |
 
 All calls use mTLS; the caller's service account certificate is its identity.
 
@@ -211,13 +210,13 @@ ib-manager subscribes to Reservation lifecycle events via the Kubernetes event b
 4. Look up the `IBPartition` for `Spec.NetworkID`
 5. For each host in `Status.HostIDs`, query Ironic for IB port GUIDs
 6. Program UFM partition (add GUIDs to the `IBPartition`)
-7. Register deletion block on the Reservation
-8. Set `ib.unikorn-cloud.org/partition-ready` True on the Reservation
+7. `PUT /reservations/{id}/references/{ref}` — register deletion block
+8. `PUT /reservations/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True
 
 **On deletion (DeletionTimestamp non-nil):**
 1. `GET /reservations/{id}` — fetch current state
 2. Remove host GUIDs from UFM partition
-3. `DELETE /reservations/{id}/references/ib-manager` — release deletion block
+3. `DELETE /reservations/{id}/references/{ref}` — release deletion block
 
 ---
 
@@ -247,6 +246,7 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 | Date | Decision | Rationale |
 |---|---|---|
 | 2026-04-01 | `Spec.NetworkID` carried on Reservation | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Reservation self-describing. |
+| 2026-04-01 | Deletion blocking via reference REST API, not direct finalizer writes | Per platform spec section 5.3, external services never write another service's finalizers directly. The reservation service exposes canonical `PUT`/`DELETE` reference endpoints and manages finalizers internally. |
 
 ---
 
