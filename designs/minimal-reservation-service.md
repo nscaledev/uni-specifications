@@ -6,39 +6,42 @@ The reservation service pre-allocates bare metal hosts for a VPC before any serv
 
 **The problem it solves.** Bare metal host selection by Nova placement is opportunistic — at `nova boot` time, placement picks whatever host satisfies the flavour constraints. For workloads that need pre-boot infrastructure programming (IB partition assignment, network programming, topology-aware placement), the host must be known and programmed before the boot call. The reservation service pins the host early and holds it, allowing dependent services to complete their programming against a stable host identity before any instance runs.
 
-**What the reservation service does.** A caller creates a Reservation specifying a region, a flavour, and a set of readiness gates. The controller selects an available host of the right flavour, creates a Nova host aggregate containing that host, and records the aggregate ID in status. External services (e.g. ib-manager) receive a notification, perform their per-host programming, and signal readiness by setting a named condition on the Reservation via the reservation service REST API. Once all gates are satisfied and the Reservation is marked Ready, a caller can create a Server against it: the region service reads the aggregate ID from the Reservation and passes it to Nova as a scheduler hint, constraining placement to the pre-programmed host.
+**What the reservation service does.** The operative concept in the minimal design is the *Placement*. A caller creates a Placement specifying a region, a flavour, a VPC, and a set of readiness gates. The controller selects available hosts of the right flavour, creates a Nova host aggregate containing those hosts, and records the aggregate ID and selected host list in status. External services (e.g. ib-manager) receive a Placement creation event, perform their per-host programming, and signal readiness by setting a named condition on the Placement via the reservation service REST API. Once all gates are satisfied and the Placement is marked Ready, callers can create Servers: the region service reads the aggregate ID from the Placement and passes it to Nova as a scheduler hint, constraining placement to the pre-programmed hosts.
 
-**Scope.** This design covers the minimal case: one host per Reservation. Multi-host reservations (e.g. a full rack) are a planned expansion but not designed here.
+**Scope.** This design covers the minimal case: one host per Placement. Multi-host Placements with topology constraints, and Reservations as a capacity management layer above Placements, are planned expansions but not designed here.
 
 ---
 
 ## Design
 
-### CRD: `OpenStackReservation`
+### CRD: `OpenStackPlacement`
 
-The `OpenStackReservation` CRD is internal to the reservation service. Its schema uses OpenStack terminology directly — there is no provider abstraction.
+The `OpenStackPlacement` CRD is internal to the reservation service. Its schema uses OpenStack terminology directly — there is no provider abstraction.
 
 ```go
-type OpenStackReservationSpec struct {
+type OpenStackPlacementSpec struct {
     // Region in which to allocate a host
     RegionID string
-    // VPC (Network) this Reservation is associated with.
+    // VPC (Network) this Placement is associated with.
     // External services (e.g. ib-manager) use this to determine which
-    // partition or network resource to program for the reserved host.
+    // partition or network resource to program for the placed hosts.
     NetworkID string
     // Flavour determining which class of host to select
     FlavorID string
-    // Condition types that must be True before this Reservation is usable.
+    // Condition types that must be True before this Placement is usable.
     // Copied verbatim from Region.Spec.ReadinessGates at creation time.
     ReadinessGates []string
 }
 
-type OpenStackReservationStatus struct {
-    // Nova host aggregate UUID created for this Reservation
+type OpenStackPlacementStatus struct {
+    // Nova host aggregate UUID created for this Placement.
+    // Also serves as the disjointness signal: hosts in this aggregate
+    // are ineligible for selection by any other Placement.
     AggregateID string
-    // Ironic node UUIDs of the hosts assigned to this Reservation.
-    // Set by the controller after host selection; read by external services
-    // (e.g. ib-manager) to discover which hosts to program.
+    // Ironic node UUIDs of the hosts assigned to this Placement.
+    // Set by the controller after host selection; immutable thereafter.
+    // Read by external services (e.g. ib-manager) to discover which
+    // hosts to program.
     HostIDs []string
     // Standard Kubernetes conditions.
     // Includes the controller-owned Ready condition and any gate conditions
@@ -48,29 +51,29 @@ type OpenStackReservationStatus struct {
 ```
 
 **Conditions:**
-- `Allocated` — set True by the controller once hosts have been selected and the Nova aggregate created. This is the controller's own signal that the Reservation has been populated.
+- `Allocated` — set True by the controller once hosts have been selected, added to the aggregate, and recorded in `Status.HostIDs`. This is the controller's own signal that the Placement has been populated.
 - Gate conditions (e.g. `ib.unikorn-cloud.org/partition-ready`) — set by external services via the REST API, as named in `Spec.ReadinessGates`.
 - `Ready` — set True by the controller only when `Allocated` is True and every condition named in `Spec.ReadinessGates` is also True.
 
 Consumers (e.g. the Server provisioner) wait only for `Ready == True`. They do not inspect individual gate conditions — that aggregation is the controller's responsibility.
+
+**Immutability.** `Status.HostIDs` does not change after it is first set. This is required so that the readiness gate fires exactly once and the programmed state of external services (e.g. the UFM partition) remains stable.
 
 ### Controller
 
 On creation (DeletionTimestamp nil):
 
 ```
-1. Select an available host
-       Query Ironic for nodes with a resource class matching FlavorID
-       Filter out nodes already referenced in another active Reservation
-       Pick one node
+1. Select available hosts
+       See Host Selection below
 
 2. Create Nova host aggregate
        POST /compute/v2/os-aggregates
-       Add the selected host to the aggregate
+       Add the selected hosts to the aggregate
 
 3. Record in status
        Status.AggregateID = aggregate UUID
-       Status.HostIDs = [ironic node UUID]
+       Status.HostIDs = [ironic node UUIDs]
        Set Allocated condition True
 
 4. Recompute Ready
@@ -88,17 +91,17 @@ On deletion (DeletionTimestamp non-nil):
 2. Delete Nova host aggregate
        DELETE /compute/v2/os-aggregates/{id}
 
-3. Remove controller finalizer — Reservation is deleted
+3. Remove controller finalizer — Placement is deleted
 ```
 
 The controller adds its own finalizer on creation to ensure the deletion path runs before the object is removed from etcd.
 
 ### Host Selection
 
-The controller queries the OpenStack Placement API to find available hosts. Each Ironic node is a resource provider in Placement, with its UUID matching the Ironic node UUID. A bare metal node exposes one unit of a single custom resource class derived from its `resource_class` field (e.g. `baremetal-large` → `CUSTOM_BAREMETAL_LARGE`).
+The controller queries the OpenStack Placement API to find available hosts, then filters for hosts not already committed to another Placement.
 
 **Step 1 — Resolve the resource class from the flavour.**
-The flavour's extra specs contain `resources:CUSTOM_BAREMETAL_LARGE=1` (or equivalent). The controller queries Nova for the flavour and reads the `resources:CUSTOM_*` key to obtain the resource class name. No separate mapping is needed.
+The flavour's extra specs contain `resources:CUSTOM_BAREMETAL_LARGE=1` (or equivalent). The controller queries Nova for the flavour and reads the `resources:CUSTOM_*` key to obtain the resource class name.
 
 **Step 2 — Query Placement for available hosts.**
 
@@ -106,22 +109,23 @@ The flavour's extra specs contain `resources:CUSTOM_BAREMETAL_LARGE=1` (or equiv
 GET /placement/resource_providers?resources=CUSTOM_BAREMETAL_LARGE:1
 ```
 
-This returns only resource providers with free capacity — i.e. nodes registered in Placement with no existing allocation. This is the correct source of truth because:
-- A node being deployed by Nova is already marked consumed in Placement, even though its Ironic provision state is still `deploying`. Querying Ironic alone would incorrectly consider it available.
-- Placement's inventory is authoritative for Nova scheduling; using it for host selection aligns the reservation service's view with the scheduler's view.
+This returns only resource providers with free capacity. This is the correct source of truth because a node mid-deploy is already marked consumed in Placement even though its Ironic provision state is still `deploying`.
 
-**Step 3 — Cross-check against Ironic.**
-Placement has a ~60-second sync lag from Ironic. To guard against stale data, each candidate returned by Placement is checked directly against Ironic:
+**Step 3 — Filter by aggregate membership.**
+Each candidate is checked against Nova: any host already a member of an existing Placement aggregate is excluded. This is the disjointness mechanism — it ensures a host cannot be assigned to more than one Placement without requiring cross-CRD scanning.
+
+**Step 4 — Cross-check against Ironic.**
+Placement has a ~60-second sync lag from Ironic. To guard against stale data, each remaining candidate is checked directly against Ironic:
 - `provision_state == available`
 - `maintenance == false`
 
-A host passing both checks is selected.
+A host passing all checks is selected.
 
-If no host is available, the controller sets an `HostUnavailable` condition and requeues. Host selection is best-effort with no distributed lock — in the event of a race between two concurrent Reservations selecting the same host, the aggregate creation for one will succeed and ib-manager will catch the conflict on the other when it attempts to programme the same GUIDs. The minimal service accepts this: single-host reservations with human-driven scheduling make races rare in practice.
+If no host is available, the controller sets a `HostUnavailable` condition and requeues. Host selection is best-effort with no distributed lock — in the event of a race between two concurrent Placements selecting the same host, the aggregate-membership check reduces but does not eliminate the window. The minimal service accepts this: single-host Placements with human-driven scheduling make races rare in practice.
 
 ### Resource References
 
-External services that perform per-host programming register a deletion block on the Reservation while their programming is active. This prevents the aggregate from being torn down before the programming is reversed.
+External services that perform per-host programming register a deletion block on the Placement while their programming is active. This prevents the aggregate from being torn down before the programming is reversed.
 
 Per the platform spec (section 5.3), references cross service boundaries via the owning service's reference REST API — external services never write another service's finalizers directly. The reservation service exposes `PUT` and `DELETE` reference endpoints; internally it translates these into finalizer operations on its own CRD. The reference string format follows the canonical `{resource}.{group}/{uuid}` scheme produced by `GenerateResourceReference`.
 
@@ -129,15 +133,15 @@ Per the platform spec (section 5.3), references cross service boundaries via the
 
 ```
 ib-manager programs IB partition
-    → PUT .../reservations/{id}/references/{ref}
-    → reservation service adds finalizer to Reservation CRD
+    → PUT .../placements/{id}/references/{ref}
+    → reservation service adds finalizer to Placement CRD
 
-Reservation deleted (DeletionTimestamp set)
+Placement deleted (DeletionTimestamp set)
     → controller sees inbound reference via GetResourceReferences(), requeues
 
 ib-manager receives deletion event, reverses UFM programming
-    → DELETE .../reservations/{id}/references/{ref}
-    → reservation service removes finalizer from Reservation CRD
+    → DELETE .../placements/{id}/references/{ref}
+    → reservation service removes finalizer from Placement CRD
 
 No references remain
     → controller proceeds: deletes aggregate, removes its own finalizer
@@ -148,20 +152,20 @@ No references remain
 Full end-to-end deletion sequence:
 
 ```
-User deletes Reservation
+User deletes Placement
     │ DeletionTimestamp set
     ▼
 Event bus fires → external services receive deletion notification
     ib-manager:
         Removes host GUIDs from UFM partition
-        DELETE .../reservations/{id}/references/{ref}
+        DELETE .../placements/{id}/references/{ref}
 
-Reservation controller (requeued):
+Placement controller (requeued):
     GetResourceReferences() non-empty?
         Yes → requeue
         No  → DELETE Nova aggregate
               Remove controller finalizer
-              Reservation removed from etcd
+              Placement removed from etcd
 ```
 
 ---
@@ -172,12 +176,12 @@ All endpoints are called by external services (region service, ib-manager). The 
 
 | Method | Path | Caller | Purpose |
 |---|---|---|---|
-| `POST` | `/reservations` | Region service | Create a Reservation |
-| `GET` | `/reservations/{id}` | Region service, ib-manager | Read full Reservation state (host list, aggregate ID, conditions) |
-| `DELETE` | `/reservations/{id}` | Region service | Delete a Reservation |
-| `PUT` | `/reservations/{id}/conditions/{type}` | ib-manager | Set a named condition (e.g. `ib.unikorn-cloud.org/partition-ready: True`) |
-| `PUT` | `/reservations/{id}/references/{name}` | ib-manager | Register a deletion block (idempotent) |
-| `DELETE` | `/reservations/{id}/references/{name}` | ib-manager | Release a deletion block (idempotent) |
+| `POST` | `/placements` | Region service | Create a Placement |
+| `GET` | `/placements/{id}` | Region service, ib-manager | Read full Placement state (host list, aggregate ID, conditions) |
+| `DELETE` | `/placements/{id}` | Region service | Delete a Placement |
+| `PUT` | `/placements/{id}/conditions/{type}` | ib-manager | Set a named condition (e.g. `ib.unikorn-cloud.org/partition-ready: True`) |
+| `PUT` | `/placements/{id}/references/{name}` | ib-manager | Register a deletion block (idempotent) |
+| `DELETE` | `/placements/{id}/references/{name}` | ib-manager | Release a deletion block (idempotent) |
 
 All calls use mTLS; the caller's service account certificate is its identity.
 
@@ -185,9 +189,9 @@ All calls use mTLS; the caller's service account certificate is its identity.
 
 ## Integration with the Region Service
 
-### Creating a Reservation
+### Creating a Placement
 
-The region service creates a Reservation when a Network is provisioned in an IB-capable region (or more generally, whenever the Region's `Spec.ReadinessGates` is non-empty). The Reservation is created with:
+The region service creates a Placement when a Network is provisioned in an IB-capable region (or more generally, whenever the Region's `Spec.ReadinessGates` is non-empty). The Placement is created with:
 - `RegionID` from the Network's region
 - `NetworkID` from the Network being provisioned
 - `FlavorID` from the intended Server flavour
@@ -198,52 +202,52 @@ The region service creates a Reservation when a Network is provisioned in an IB-
 ```
 Region service creates Server
 
-    1. Fetch Reservation via reservation service REST API
+    1. Fetch Placement via reservation service REST API
     2. Check Ready == True
            If False or absent: Server stays pending, requeue
 
     3. Ready == True:
-           Read Status.AggregateID from Reservation
+           Read Status.AggregateID from Placement
            POST /compute/v2/servers with scheduler hint:
                os:scheduler_hints:
                  aggregate_instance_extra_specs:
-                   unikorn-reservation: {reservation-id}
+                   unikorn-placement: {placement-id}
            (Aggregate metadata key set by reservation service at aggregate creation time)
 ```
 
 Nova placement selects the single host within the aggregate. Because only one host is in the aggregate and all pre-boot programming is complete, placement is deterministic.
 
-### Server-to-Reservation relationship
+### Placement-to-Server relationship
 
-In the minimal service, one Reservation is consumed by at most one Server. The region service is responsible for enforcing this: once a Server has been booted against a Reservation, the Reservation is considered consumed and should not be reused.
+In the minimal service, one Placement is consumed by at most one Server. The region service is responsible for enforcing this: once a Server has been booted against a Placement, the Placement is considered consumed and should not be reused.
 
 ---
 
 ## Integration with ib-manager
 
-ib-manager subscribes to Reservation lifecycle events via the Kubernetes event bus (informer on the Reservation CRD). The envelope carries `ResourceID` and `DeletionTimestamp`.
+ib-manager subscribes to Placement lifecycle events via the Kubernetes event bus (informer on the `OpenStackPlacement` CRD). The envelope carries `ResourceID` and `DeletionTimestamp`.
 
 **On creation (DeletionTimestamp nil):**
-1. `GET /reservations/{id}` — fetch full state including `Spec.NetworkID` and `Status.HostIDs`
+1. `GET /placements/{id}` — fetch full state including `Spec.NetworkID` and `Status.HostIDs`
 2. Fetch flavour via region service REST API → `FlavorInfiniBandSpec.PortCount`
 3. If `PortCount == 0`: set `ib.unikorn-cloud.org/partition-ready` True — done
 4. Look up the `IBPartition` for `Spec.NetworkID`
 5. For each host in `Status.HostIDs`, query Ironic for IB port GUIDs
 6. Program UFM partition (add GUIDs to the `IBPartition`)
-7. `PUT /reservations/{id}/references/{ref}` — register deletion block
-8. `PUT /reservations/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True
+7. `PUT /placements/{id}/references/{ref}` — register deletion block
+8. `PUT /placements/{id}/conditions/ib.unikorn-cloud.org/partition-ready` True
    → reservation service controller requeues, recomputes Ready
 
 **On deletion (DeletionTimestamp non-nil):**
-1. `GET /reservations/{id}` — fetch current state
+1. `GET /placements/{id}` — fetch current state
 2. Remove host GUIDs from UFM partition
-3. `DELETE /reservations/{id}/references/{ref}` — release deletion block
+3. `DELETE /placements/{id}/references/{ref}` — release deletion block
 
 ---
 
 ## Event Bus
 
-The reservation service publishes Reservation lifecycle events to the Kubernetes event bus using the same envelope pattern as the region service: `ResourceID` and `DeletionTimestamp`. Subscribers (ib-manager) wire up a Kubernetes informer on the Reservation CRD type.
+The reservation service publishes Placement lifecycle events to the Kubernetes event bus using the same envelope pattern as the region service: `ResourceID` and `DeletionTimestamp`. Subscribers (ib-manager) wire up a Kubernetes informer on the `OpenStackPlacement` CRD type.
 
 `DeletionTimestamp == nil` → creation or update event.
 `DeletionTimestamp` non-nil → deletion in progress; subscriber should reverse its programming.
@@ -252,13 +256,13 @@ The reservation service publishes Reservation lifecycle events to the Kubernetes
 
 ## Future Expansion
 
-The minimal design is deliberately constrained to one host per Reservation. The intended expansion path:
+The minimal design is deliberately constrained to one host per Placement and no topology constraints. The intended expansion path:
 
-- Add `Spec.Count int` (defaulting to 1) to support multi-host reservations
-- `Status.HostIDs` already a slice — no schema change needed for the multi-host case
-- Host selection logic generalises from "pick one" to "pick N"
-- Resource reference and gate mechanisms are unchanged
-- Further expansion to rack-level reservations would add a `Spec.Topology` field describing the grouping constraint (e.g. all hosts on the same top-of-rack switch)
+**Multi-host Placements.** Add `Spec.Count int` (defaulting to 1) to support multi-host Placements. `Status.HostIDs` is already a slice — no schema change needed. Host selection generalises from "pick one" to "pick N satisfying the topology constraint."
+
+**Topology constraints.** Add a `Spec.Topology` field describing the placement policy: rack affinity (contiguous racks, hard-fail if unavailable), rack spread (anti-affinity with max-skew per rack, soft or hard), and similar. Topology is evaluated at host selection time within the Placement controller. The aggregate membership disjointness check runs first; the topology filter runs over the remaining candidates. This covers use cases P1 (rack-contiguous production) and P2 (cross-rack dev spread) from the use-case set.
+
+**Reservations as a capacity management layer.** An `OpenStackReservation` CRD can be added above Placements to provide advance capacity booking and multi-Placement capacity management. A Reservation claims N units of a given flavour (possibly time-bound) and the Placement draws from that reserved pool rather than the open pool. This enables use cases R3 (future-dated bookings) and R4 (ranked fallback) and allows a policy decision about whether unreserved Placements are permitted. In the minimal design this layer is absent and all capacity is first-come first-served.
 
 ---
 
@@ -266,31 +270,34 @@ The minimal design is deliberately constrained to one host per Reservation. The 
 
 | Date | Decision | Rationale |
 |---|---|---|
-| 2026-04-01 | `Spec.NetworkID` carried on Reservation | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Reservation self-describing. |
+| 2026-04-01 | `Spec.NetworkID` carried on Placement | External services (e.g. ib-manager) need the VPC association to know which partition or network resource to program. Carrying it in Spec avoids a separate lookup and makes the Placement self-describing. |
 | 2026-04-01 | Deletion blocking via reference REST API, not direct finalizer writes | Per platform spec section 5.3, external services never write another service's finalizers directly. The reservation service exposes canonical `PUT`/`DELETE` reference endpoints and manages finalizers internally. |
-| 2026-04-01 | CRD named `OpenStackReservation` | The CRD is OpenStack-specific (Nova aggregates, Ironic node UUIDs). Making the provider explicit in the type name is consistent with the design's stated principle of no provider abstraction, and avoids naming conflicts if other provider types are added later. |
+| 2026-04-01 | CRD named `OpenStackPlacement` | The CRD is OpenStack-specific (Nova aggregates, Ironic node UUIDs). Making the provider explicit in the type name is consistent with the design's stated principle of no provider abstraction, and avoids naming conflicts if other provider types are added later. |
 | 2026-04-01 | Host selection via Placement API, cross-checked against Ironic | `GET /placement/resource_providers?resources=<class>:1` gives a more accurate availability view than querying Ironic directly — it reflects Nova allocations for nodes mid-deploy. Resource class is resolved from the flavour's `resources:CUSTOM_*` extra spec. Ironic is still checked to guard against Placement's ~60s sync lag. |
+| 2026-04-08 | Disjointness enforced via Nova aggregate membership | A host already in any Placement aggregate is excluded from selection by a new Placement. This uses Nova's own state as the source of truth rather than scanning CRDs, and provides the same guarantee with less coordination. |
+| 2026-04-08 | Topology constraints are a Placement concern, not a Reservation concern | Topology is a placement policy — where to put hosts — not a capacity policy. Rack affinity and spread are placement use cases. The Reservation layer (when added) expresses count and time bounds; the Placement expresses topology. |
+| 2026-04-08 | Minimal design uses Placements only; Reservations deferred | IB partitioning requires only a stable host list, a VPC binding, and readiness gates — all of which are Placement properties. The Reservation layer adds capacity management and advance booking, which are not needed for the minimal IB case. Deferring it removes one CRD and one controller from the minimal implementation. |
 
 ---
 
 ## Migration
 
-The current system boots servers directly via Nova with no pre-placement, no Reservations, and no readiness gates. The migration must be non-breaking for existing regions and existing servers.
+The current system boots servers directly via Nova with no pre-placement, no Placements, and no readiness gates. The migration must be non-breaking for existing regions and existing servers.
 
 ### Existing regions — no change required
 
-`Region.Spec.ReadinessGates` is a new optional field that defaults to empty. An empty gate list means no gates are required before a Reservation is used as a scheduler hint — and with no Reservation in the boot path at all, existing regions behave exactly as before. No operator action is needed for regions that do not have an IB fabric.
+`Region.Spec.ReadinessGates` is a new optional field that defaults to empty. An empty gate list means no gates are required before a Placement is used as a scheduler hint — and with no Placement in the boot path at all, existing regions behave exactly as before. No operator action is needed for regions that do not have an IB fabric.
 
 ### New IB-capable regions — opt-in by operator
 
-A region with an IB fabric is configured with `ib.unikorn-cloud.org/partition-ready` in `Region.Spec.ReadinessGates` at deploy time. Only these regions use Reservations and gate-based pre-boot coordination. Enabling ib-manager for a region is a single operator change to the Region definition; no flavour updates or server changes are needed.
+A region with an IB fabric is configured with `ib.unikorn-cloud.org/partition-ready` in `Region.Spec.ReadinessGates` at deploy time. Only these regions use Placements and gate-based pre-boot coordination. Enabling ib-manager for a region is a single operator change to the Region definition; no flavour updates or server changes are needed.
 
 ### Existing servers — no backfill
 
-Servers already running have no associated Reservation. They do not need one: IB partitions for running servers were never programmed (there was no ib-manager), and retrofitting a Reservation to a running server would not change the hardware state. The Server provisioner must handle both cases:
+Servers already running have no associated Placement. They do not need one: IB partitions for running servers were never programmed (there was no ib-manager), and retrofitting a Placement to a running server would not change the hardware state. The Server provisioner must handle both cases:
 
-- **No Reservation reference on the Server:** use the existing direct Nova placement path (current behaviour, unchanged).
-- **Reservation reference present:** check all gates, then boot with the aggregate scheduler hint.
+- **No Placement reference on the Server:** use the existing direct Nova placement path (current behaviour, unchanged).
+- **Placement reference present:** check all gates, then boot with the aggregate scheduler hint.
 
 This conditional is the only place in the codebase where the old and new paths diverge. Existing servers continue to work without modification.
 
@@ -301,7 +308,7 @@ All CRD changes introduced by this design are additive optional fields:
 | Resource | New field | Default | Impact on existing resources |
 |---|---|---|---|
 | `Region` | `Spec.ReadinessGates []string` | `[]` (empty) | None — existing Regions have no gates |
-| `Reservation` | Entire new CRD | — | None — no existing Reservations |
+| `OpenStackPlacement` | Entire new CRD | — | None — no existing Placements |
 | `Flavor` | `Spec.InfiniBand.PortCount int` | `0` | None — existing Flavours have zero IB ports |
 
 No data migration is required. Existing resources are valid under the new schema without modification.
@@ -323,16 +330,16 @@ Two deployment options exist. The choice has not yet been made.
 
 ### Option A: Embedded in the Region Service
 
-The reservation controller and handler live inside `uni-region`. The `Reservation` CRD belongs to the region service API group.
+The Placement controller and handler live inside `uni-region`. The `OpenStackPlacement` CRD belongs to the region service API group.
 
 **Advantages:**
 - Host selection can use internal region service state directly — flavour-to-resource-class mapping, Ironic client, and existing host inventory are all in-process. No new endpoints needed.
 - One less service to deploy and operate.
-- The Reservation is a natural extension of region concepts (flavours, hosts, aggregates).
+- The Placement is a natural extension of region concepts (flavours, hosts, aggregates).
 
 **Disadvantages:**
-- The region service grows larger. Reservation lifecycle (host selection, aggregate management, gate coordination) is a distinct concern from network and identity management.
-- All consumers (ib-manager, future gate services) already call the region service; adding reservation endpoints there conflates two separate responsibilities.
+- The region service grows larger. Placement lifecycle (host selection, aggregate management, gate coordination) is a distinct concern from network and identity management.
+- All consumers (ib-manager, future gate services) already call the region service; adding placement endpoints there conflates two separate responsibilities.
 
 ### Option B: Separate Service (`uni-reservation`)
 
@@ -353,12 +360,14 @@ The reservation service is a standalone binary with its own CRDs, API, and deplo
 
 ## Open Questions
 
-1. **Host selection race:** The minimal service accepts a best-effort selection with no distributed lock. Is this acceptable for the target deployment, or does the host pool turn over fast enough that races are a real concern?
+1. **Host selection race:** The minimal service accepts a best-effort selection with no distributed lock. The aggregate-membership filter reduces the race window but does not eliminate it: two concurrent Placements can both pass the filter before either has created its aggregate. Is this acceptable for the target deployment?
 
-2. **Aggregate scheduler hint mechanism:** The design uses `aggregate_instance_extra_specs` with a `unikorn-reservation` metadata key on the aggregate, requiring `AggregateInstanceExtraSpecsFilter` in Nova's scheduler filter list. This needs to be confirmed as enabled in the target deployment.
+2. **Aggregate scheduler hint mechanism:** The design uses `aggregate_instance_extra_specs` with a `unikorn-placement` metadata key on the aggregate, requiring `AggregateInstanceExtraSpecsFilter` in Nova's scheduler filter list. This needs to be confirmed as enabled in the target deployment.
 
 3. ~~**Flavour-to-resource-class mapping:**~~ Resolved — the resource class is read directly from the flavour's `resources:CUSTOM_*` extra spec. No separate mapping needed.
 
-4. **Reservation ownership:** Who owns the lifecycle of a Reservation — is it created and deleted by the region service on behalf of a user, or is it a user-visible resource? For the minimal service, treating it as an internal implementation detail of the region service (not directly user-facing) is simplest.
+4. **Placement ownership:** Who owns the lifecycle of a Placement — is it created and deleted by the region service on behalf of a user, or is it a user-visible resource? For the minimal service, treating it as an internal implementation detail of the region service (not directly user-facing) is simplest.
 
 5. **Service placement:** Should the reservation service be embedded in `uni-region` (Option A) or deployed as a separate service `uni-reservation` (Option B)? See the Service Placement section. The deciding factor is likely host selection: if a "list available hosts for flavour" endpoint can be added to the region service, Option B becomes more viable. If not, Option A avoids duplicating Ironic and flavour-mapping logic.
+
+6. **Rack membership data source for topology-aware host selection:** When topology constraints are added to Placements, the host selection algorithm must group candidate hosts by rack. The OpenStack Placement API returns individual resource providers (Ironic node UUIDs) with no rack grouping. A source of rack membership per node is needed — e.g. Ironic node traits, nested resource providers in Placement, or an operator-maintained topology map. This needs to be confirmed against the target deployment before topology-aware selection can be designed.
