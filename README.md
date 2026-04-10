@@ -6,6 +6,12 @@ The **[Unified Architectural Specification](SPECIFICATION.md)** is the single so
 
 Each service repository contains a `CLAUDE.md` that references this document. AI agents should fetch the raw content of `SPECIFICATION.md` directly for full platform context.
 
+## Region Specifications
+
+Public Region abstractions that sit above provider-specific behavior are documented separately:
+
+* [Load Balancers v2](specifications/region/load-balancers.md)
+
 ## Provider-Specific Specifications
 
 Provider-specific configuration that sits below the platform abstraction boundary is documented separately:
@@ -14,3 +20,4 @@ Provider-specific configuration that sits below the platform abstraction boundar
 
 * [Flavor and Image Handling](specifications/providers/openstack/flavors_and_images.md)
 * [External Networks](specifications/providers/openstack/external-networks.md)
+* [Load Balancers](specifications/providers/openstack/load-balancers.md)
