@@ -8,6 +8,7 @@ The standard Region v2 resource envelope and the platform-wide rules in [SPECIFI
 
 | Version | Date | Notes |
 |---|---|---|
+| v0.3 | 2026-04-11 | Members specified by IP address instead of compute-instance reference; Compute-Member Lifecycle cross-service dependency removed; VIP stability and `Available` precondition guarantees added |
 | v0.2 | 2026-04-10 | Review update: empty member sets, dependency-triggered deletion, stale-member tolerance, and clarified validation/status semantics |
 | v0.1 | 2026-04-10 | Initial draft |
 
@@ -19,7 +20,7 @@ The first public abstraction is intentionally narrow:
 - Listener protocols limited to `tcp` and `udp`
 - Listener-scoped `allowedCidrs`
 - Top-level `publicIP`
-- Backend members limited to `uni-compute` instances
+- Backend members specified by IPv4 address
 - Per-member backend port
 - Optional transport-level health checks only
 - Optional TCP-only `proxyProtocolV2`
@@ -28,7 +29,6 @@ The first public abstraction is intentionally narrow:
 
 The following are explicitly not part of v1:
 
-- Raw IP-address members
 - HTTP and HTTPS listeners
 - Terminated TLS
 - L7 routing or policies
@@ -140,9 +140,11 @@ Rules:
 
 - `organizationId`, `projectId`, `regionId`, and `networkId` are immutable after create.
 - `publicIP` is mutable.
-- `networkId` is the required backend network for all referenced compute instances.
+- `networkId` is the required backend network. All member addresses must be reachable on this network.
 - `spec.publicIP` requests a public VIP address and `status.publicIP` reports the allocated public IPv4. This intentionally matches the existing instance API naming convention.
+- `status.vipAddress` is stable for the lifetime of the load balancer. Once allocated, the VIP does not change.
 - There is no `vipAddress` request field in create or update. Callers cannot request a specific VIP or private address in v1, so Kubernetes `spec.loadBalancerIP`-style workflows are unsupported.
+- `Available=True` must not be reported until `status.vipAddress` is populated.
 - The public status surface is provider-agnostic. Provider IDs, per-listener operating status, per-member health, statistics, the algorithm, the status tree, and driver names are not exposed in v1.
 
 ## Listener Schema
@@ -189,29 +191,28 @@ Pool rules:
 - Omitted `proxyProtocolV2` defaults to `false`.
 - `proxyProtocolV2=true` means the backend connection is wrapped in PROXY protocol version 2.
 - `members` may be `[]` on create or update.
-- A load balancer with zero effective backends, meaning no member currently resolves to a live in-scope instance with a usable private IP, remains present and still receives a VIP, but does not report `Available=True` until at least one backend becomes effective.
+- A load balancer with zero members remains present and still receives a VIP, but does not report `Available=True` until at least one backend is effective.
 - There is no public `algorithm` field.
 - The implementation fixes the hidden algorithm to `ROUND_ROBIN`.
 
 ## Member Schema
 
-Members are limited to `uni-compute` instances in v1.
+Members are specified by IPv4 address.
 
 Each `LoadBalancerMemberV2` contains:
 
 | Field | Required | Description |
 |---|---|---|
-| `instanceId` | yes | Referenced compute instance. |
+| `address` | yes | IPv4 address of the backend member. |
 | `port` | yes | Backend port used for this member. |
 
 Member rules:
 
-- `instanceId` is required.
+- `address` is required and must be a valid IPv4 address (not a CIDR, not a hostname).
 - `port` is required and must be an integer in the range `1..65535`.
-- Duplicate `instanceId` values in one pool are rejected.
-- The same `instanceId` may appear in different pools if the resulting backends remain distinct.
-- Duplicate resolved `(privateIP, port)` backends are rejected once instance IPs are known.
-- Raw IP-address members are unsupported in v1.
+- Duplicate `(address, port)` pairs in one pool are rejected.
+- The same `address` may appear in different pools if the resulting `(address, port)` backends remain distinct.
+- The same `address` may appear multiple times in one pool with different `port` values.
 
 ## Health Check Schema
 
@@ -255,25 +256,18 @@ Create and update validation must enforce all of the following:
 - `timeoutSeconds` must be less than `intervalSeconds` when a health check is present.
 - Duplicate listener names are rejected.
 - Duplicate `(protocol, port)` listeners are rejected.
-- Duplicate `instanceId` members in the same pool are rejected.
-- Duplicate resolved `(privateIP, port)` backends are rejected.
-- On create, every supplied `instanceId` resolves through the Compute v2 API and belongs to the same organization, project, region, and network as the load balancer.
-- A referenced compute instance may exist before private IP assignment. In that case the load balancer remains provisioning until the address resolves.
-- On update, every newly added or modified member must resolve and belong to the same organization, project, region, and network as the load balancer.
-- On update, unchanged stale members whose instances are now `DELETING` or already gone are tolerated temporarily so clients can perform unrelated updates and then remove or replace them.
+- Every member `address` must be a valid IPv4 address.
+- Duplicate `(address, port)` members in the same pool are rejected.
+- Member addresses are not validated for reachability at submission time. Network-layer reachability is the caller's responsibility.
 
 Preferred response behavior:
 
 | Condition | Preferred response |
 |---|---|
-| Invalid IPv4 CIDR syntax in `allowedCidrs`, invalid listener name format, or out-of-range numeric field values | `400 invalid_request` |
+| Invalid IPv4 CIDR syntax in `allowedCidrs`, invalid listener name format, invalid member `address`, or out-of-range numeric field values | `400 invalid_request` |
 | Unsupported field combinations such as `proxyProtocolV2=true` on `udp` or `idleTimeoutSeconds` on `udp` | `422 unprocessable_content` |
 | `timeoutSeconds >= intervalSeconds` | `422 unprocessable_content` |
-| Duplicate listener names, duplicate `(protocol, port)` listeners, duplicate `instanceId` members in one pool, or duplicate resolved `(privateIP, port)` backends | `422 unprocessable_content` |
-| Newly supplied `instanceId` cannot be resolved to a usable compute instance in the same scope | `422 unprocessable_content` |
-| Resolved compute instance is on a different network | `422 unprocessable_content` |
-
-The validation error for an unusable `instanceId` must be generic. It must not disclose whether the supplied ID was nonexistent, unreadable, or merely outside the caller's scope.
+| Duplicate listener names, duplicate `(protocol, port)` listeners, or duplicate `(address, port)` members in one pool | `422 unprocessable_content` |
 
 ## Cross-Service Semantics
 
@@ -283,29 +277,12 @@ The validation error for an unusable `instanceId` must be generic. It must not d
 - If the referenced network enters `DELETING`, Region must initiate deletion of the dependent load balancer.
 - The network is not blocked by the load balancer. Deleting the network triggers load balancer deletion instead of being rejected.
 
-### Compute-Member Lifecycle
+### Member Address Semantics
 
-- Load balancer membership does not place a permanent blocking reference on member compute instances.
-- Region subscribes to compute-instance lifecycle events through the platform event mechanism.
-- On a compute-instance event, Region re-reads the compute instance through the Compute API and reconciles the affected load balancer.
-- If a referenced instance's private IP changes, backend members are updated in place.
-- If a referenced instance temporarily has no private IP, the load balancer remains present but not ready until the address is available or the member is removed.
-- When a member instance enters `DELETING` or disappears, Region immediately withdraws the corresponding provider backend or member.
-- Region does not mutate the public load-balancer `spec` during that withdrawal path. The stale member entry remains until the client removes or replaces it.
-- A stale member entry that points at a deleted or deleting instance must not cause the backend to be recreated on later reconciles.
-
-### Client Responsibilities
-
-- Cluster API or other infrastructure clients should remove members as part of machine scale-down.
-- Kubernetes CCM integrations should remove members when the corresponding node disappears.
-- Clients must not rely on automatic public-spec cleanup.
-
-### Non-Running Instance Behavior
-
-- Stopped, errored, and rebooting instances are not auto-removed from the member list.
-- With `healthCheck` enabled, provider health monitoring may pull those backends out of rotation.
-- Without `healthCheck`, traffic may continue to be attempted to failed backends until the client updates the member list.
-- This is a v1 limitation.
+- Members are specified by IPv4 address. There is no cross-service dependency on compute instances.
+- The load balancer does not validate member address reachability at submission time.
+- With `healthCheck` enabled, provider health monitoring will detect and remove unreachable backends from rotation.
+- Without `healthCheck`, traffic may be attempted to unreachable backends until the client updates the member list.
 
 ## Defaults and Derived Behavior
 
@@ -319,7 +296,7 @@ The initial public behavior is:
 - `healthCheck: {}` means enabled with defaults.
 - Health-check add, remove, and parameter updates are supported in place.
 - Omitted `idleTimeoutSeconds` uses provider defaults.
-- Zero effective backends, unresolved members, or only stale withdrawn members keep the load balancer present but not yet available.
+- Zero members keep the load balancer present but not yet available.
 - The implementation is IPv4-only.
 
 Provider-specific protocol, health-monitor, timeout, and persistence mapping is defined in [OpenStack Load Balancers](../providers/openstack/load-balancers.md).
