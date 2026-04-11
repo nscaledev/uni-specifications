@@ -8,6 +8,7 @@ The initial provider assumption is Octavia with the Amphora driver. This is an i
 
 | Version | Date | Notes |
 |---|---|---|
+| v0.3 | 2026-04-11 | Members use IP addresses directly; removed compute-instance lifecycle reconciliation |
 | v0.2 | 2026-04-10 | Review update: listener-name identity, dependency-triggered deletion, stale-member withdrawal, and clarified status mapping |
 | v0.1 | 2026-04-10 | Initial draft |
 
@@ -32,7 +33,7 @@ The public abstraction maps to Octavia and Neutron as follows:
 | One Region load balancer | One Octavia load balancer |
 | One Region listener | One Octavia listener |
 | One Region pool | One Octavia pool |
-| One Region member | One Octavia member using the resolved compute private IP and configured member port |
+| One Region member | One Octavia member using the specified member address and configured member port |
 | `publicIP=true` | One Neutron floating IP attached to the VIP port |
 | Listener `allowedCidrs` | Octavia listener allowed-CIDRs feature (`allowed_cidrs` API field) |
 | Hidden public algorithm | Octavia `ROUND_ROBIN` |
@@ -74,9 +75,9 @@ The implementation adds:
 |---|---|
 | Load balancer | `loadBalancerID`, `vipPortID`, `floatingIPID?` |
 | Listener | `name`, `listenerID`, `poolID`, `healthMonitorID?`, last applied `allowedCidrs`, last applied `idleTimeoutSeconds?`, last applied `proxyProtocolV2` |
-| Member | `listenerName`, `instanceId`, `memberID`, last resolved private IP, last resolved port |
+| Member | `listenerName`, `address`, `memberID`, `port` |
 
-Listener reconciliation is keyed by the public `listener.name`, not by provider-generated IDs alone. Member persistence must be scoped per listener or pool because the same compute instance may appear in multiple pools.
+Listener reconciliation is keyed by the public `listener.name`, not by provider-generated IDs alone. Member persistence must be scoped per listener or pool because the same address may appear in multiple pools with different ports.
 
 Extend the Region provider interfaces with:
 
@@ -103,11 +104,6 @@ The OpenStack provider implementation must satisfy the following behavior:
 - Member sets and member ports are updated in place.
 - `proxyProtocolV2` changes for TCP listeners are reconciled without changing the public resource contract.
 - Toggling `publicIP` attaches or detaches the Neutron floating IP from the VIP port.
-- Region subscribes to compute-instance lifecycle events and re-reads the affected instance from the Compute API before reconciling.
-- A compute instance private IP change updates the corresponding Octavia member in place.
-- A referenced compute instance with no private IP leaves the load balancer present but non-ready until the IP is available or the member is removed.
-- When a member instance enters `DELETING` or disappears, Region immediately withdraws the corresponding Octavia backend member.
-- A stale public spec entry for a deleted or deleting instance must not recreate a withdrawn backend on later reconciles.
 
 ## Public Status Exposure
 
@@ -131,7 +127,7 @@ The following are not exposed in v1:
 
 ## Condition Mapping
 
-For status derivation, an effective backend is a member that resolves to an in-scope compute instance with a usable private IP and has not been withdrawn because the instance is being deleted or no longer exists.
+For status derivation, an effective backend is a member that has been successfully provisioned as an Octavia pool member.
 
 | Octavia or local state | Region condition mapping |
 |---|---|
@@ -139,13 +135,12 @@ For status derivation, an effective backend is a member that resolves to an in-s
 | `PENDING_DELETE` or local delete flow | `Available=False` with reason `ConditionReasonDeprovisioning` |
 | `ACTIVE` with at least one effective backend | `Available=True` with reason `ConditionReasonProvisioned` |
 | `ERROR` | `Available=False` with reason `ConditionReasonErrored` |
-| Zero effective backends, unresolved members, or only stale deleted members | `Available=False` with reason `ConditionReasonProvisioning` |
+| Zero members or zero effective backends | `Available=False` with reason `ConditionReasonProvisioning` |
 
 ## Explicitly Out of Scope
 
 This provider mapping does not include:
 
-- Raw IP-address members
 - OVN compatibility
 - HTTP or HTTPS listeners
 - Terminated TLS
@@ -167,11 +162,10 @@ This provider mapping does not include:
 
 Implementation handoff must include tests that cover:
 
-- Create a private TCP load balancer with one or more compute-instance members.
-- Create a private UDP load balancer with one or more compute-instance members.
+- Create a private TCP load balancer with one or more IP-address members.
+- Create a private UDP load balancer with one or more IP-address members.
 - Create a public load balancer with `publicIP=true`.
 - Create a load balancer with `members: []` and verify VIP allocation succeeds while `Available` stays false until a backend becomes effective.
-- Create a load balancer before compute instances have private IPs and verify it stays non-ready until the IPs resolve.
 - Create one load balancer with multiple listeners and different `allowedCidrs` per listener.
 - Create a TCP listener with `proxyProtocolV2=true`.
 - Reject `proxyProtocolV2` on UDP listeners.
@@ -192,14 +186,10 @@ Implementation handoff must include tests that cover:
 - Reject duplicate listener names.
 - Reject duplicate `(protocol, port)` listeners.
 - Reject invalid CIDRs.
-- Reject wrong-scope compute-instance references.
-- Reject duplicate `instanceId` members within one pool.
-- Allow the same compute instance in different pools on different ports.
-- Reject duplicate resolved `(privateIP, port)` backends.
+- Reject a member with an invalid IPv4 address.
+- Reject duplicate `(address, port)` members within one pool.
+- Allow the same address in different pools.
+- Allow the same address with different ports in one pool.
 - Verify network deletion triggers load balancer deletion and is not blocked by the load balancer.
-- Verify compute-instance deletion is not blocked by load balancer membership and the provider backend is withdrawn immediately.
-- Verify an unrelated load-balancer update succeeds while unchanged stale deleted members remain in `spec`.
-- Verify adding a new unresolved or wrong-scope member still fails with `422`.
-- Verify backend members are reconciled when a compute private IP changes.
-- Verify a member whose instance is not yet assigned a private IP keeps the load balancer in a non-ready state.
+- Verify member address and port updates are reconciled to Octavia in place.
 - Verify Amphora Octavia resources, floating IPs, and references are fully cleaned up on delete.
