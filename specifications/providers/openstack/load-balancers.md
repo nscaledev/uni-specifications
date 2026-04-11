@@ -8,7 +8,7 @@ The initial provider assumption is Octavia with the Amphora driver. This is an i
 
 | Version | Date | Notes |
 |---|---|---|
-| v0.3 | 2026-04-11 | Members use IP addresses directly; removed compute-instance lifecycle reconciliation |
+| v0.3 | 2026-04-11 | Members use IP addresses directly; removed compute-instance lifecycle reconciliation; `Available=True` requires `status.vipAddress` populated |
 | v0.2 | 2026-04-10 | Review update: listener-name identity, dependency-triggered deletion, stale-member withdrawal, and clarified status mapping |
 | v0.1 | 2026-04-10 | Initial draft |
 
@@ -133,7 +133,7 @@ For status derivation, an effective backend is a member that has been successful
 |---|---|
 | `PENDING_CREATE` or `PENDING_UPDATE` | `Available=False` with reason `ConditionReasonProvisioning` |
 | `PENDING_DELETE` or local delete flow | `Available=False` with reason `ConditionReasonDeprovisioning` |
-| `ACTIVE` with at least one effective backend | `Available=True` with reason `ConditionReasonProvisioned` |
+| `ACTIVE` with at least one effective backend and `status.vipAddress` populated | `Available=True` with reason `ConditionReasonProvisioned` |
 | `ERROR` | `Available=False` with reason `ConditionReasonErrored` |
 | Zero members or zero effective backends | `Available=False` with reason `ConditionReasonProvisioning` |
 

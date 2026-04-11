@@ -8,7 +8,7 @@ The standard Region v2 resource envelope and the platform-wide rules in [SPECIFI
 
 | Version | Date | Notes |
 |---|---|---|
-| v0.3 | 2026-04-11 | Members specified by IP address instead of compute-instance reference; Compute-Member Lifecycle cross-service dependency removed |
+| v0.3 | 2026-04-11 | Members specified by IP address instead of compute-instance reference; Compute-Member Lifecycle cross-service dependency removed; VIP stability and `Available` precondition guarantees added |
 | v0.2 | 2026-04-10 | Review update: empty member sets, dependency-triggered deletion, stale-member tolerance, and clarified validation/status semantics |
 | v0.1 | 2026-04-10 | Initial draft |
 
@@ -142,7 +142,9 @@ Rules:
 - `publicIP` is mutable.
 - `networkId` is the required backend network. All member addresses must be reachable on this network.
 - `spec.publicIP` requests a public VIP address and `status.publicIP` reports the allocated public IPv4. This intentionally matches the existing instance API naming convention.
+- `status.vipAddress` is stable for the lifetime of the load balancer. Once allocated, the VIP does not change.
 - There is no `vipAddress` request field in create or update. Callers cannot request a specific VIP or private address in v1, so Kubernetes `spec.loadBalancerIP`-style workflows are unsupported.
+- `Available=True` must not be reported until `status.vipAddress` is populated.
 - The public status surface is provider-agnostic. Provider IDs, per-listener operating status, per-member health, statistics, the algorithm, the status tree, and driver names are not exposed in v1.
 
 ## Listener Schema
