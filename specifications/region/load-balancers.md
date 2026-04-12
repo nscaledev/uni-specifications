@@ -8,6 +8,7 @@ The standard Region v2 resource envelope and the platform-wide rules in [SPECIFI
 
 | Version | Date | Notes |
 |---|---|---|
+| v0.4 | 2026-04-12 | Compliance review: formal edge property declaration, authentication classification, conflict detection, co-location validation, finalizer lifecycle, handler semantics, observability, open questions |
 | v0.3 | 2026-04-11 | Members specified by IP address instead of compute-instance reference; Compute-Member Lifecycle cross-service dependency removed; VIP stability and `Available` precondition guarantees added |
 | v0.2 | 2026-04-10 | Review update: empty member sets, dependency-triggered deletion, stale-member tolerance, and clarified validation/status semantics |
 | v0.1 | 2026-04-10 | Initial draft |
@@ -43,6 +44,7 @@ The following are explicitly not part of v1:
 - User-specified VIP addresses
 - Kubernetes `spec.loadBalancerIP`-style workflows
 - Listener connection limits
+- Quota enforcement (deferred; must be addressed before GA per [SPECIFICATION.md §7.6](../../SPECIFICATION.md))
 
 ## API Surface
 
@@ -54,7 +56,9 @@ Add the following Region v2 endpoints:
 - `PUT /api/v2/loadbalancers/{loadBalancerID}`
 - `DELETE /api/v2/loadbalancers/{loadBalancerID}`
 
-All write operations are asynchronous and return `202 Accepted`. Callers must poll `GET /api/v2/loadbalancers/{loadBalancerID}` and read `status.conditions` to determine whether provisioning or deletion has completed. There is no `GET /api/v2/loadbalancers/{loadBalancerID}/status`.
+All endpoints are **Public** (OAuth2 bearer token, no OpenAPI extension required). RBAC is enforced against the derived user principal per [SPECIFICATION.md §7.2.1](../../SPECIFICATION.md).
+
+All write operations are asynchronous and return `202 Accepted`. Callers must poll `GET /api/v2/loadbalancers/{loadBalancerID}` and read `status.conditions` to determine whether provisioning or deletion has completed. There is no `GET /api/v2/loadbalancers/{loadBalancerID}/status`. `DELETE` on a resource that already has a deletion timestamp set returns `202` without re-triggering deletion.
 
 List filters follow existing Region v2 conventions:
 
@@ -65,6 +69,8 @@ List filters follow existing Region v2 conventions:
 - `tag`
 
 The `tag` filter applies generic resource metadata tags inherited from the standard Region v2 envelope. This document does not add a load-balancer-specific `tags` field under `spec`.
+
+List results are sorted stably by name for deterministic ordering per [SPECIFICATION.md §7.8](../../SPECIFICATION.md).
 
 RBAC adds the new scope:
 
@@ -164,6 +170,7 @@ Listener rules:
 
 - `name` is the stable reconciliation identity for the listener.
 - Renaming a listener is treated as delete-and-create, not an in-place rename.
+- Changing a listener's `protocol` or `port` while keeping the same `name` is an in-place update. The `(protocol, port)` uniqueness constraint is validated against the full submitted listener set, not the previous state.
 - `name` must be 1 to 63 characters, use only ASCII alphanumerics and `-`, start with an alphanumeric, end with an alphanumeric, and be unique within the load balancer.
 - `(protocol, port)` must be unique within the load balancer.
 - `port` must be an integer in the range `1..65535`.
@@ -171,7 +178,7 @@ Listener rules:
 - Omitted or empty `allowedCidrs` means unrestricted ingress for that listener on both create and update.
 - Every `allowedCidrs` entry must be a valid IPv4 CIDR.
 - `idleTimeoutSeconds` is valid only for `tcp`.
-- `idleTimeoutSeconds` must be an integer greater than or equal to `1`.
+- `idleTimeoutSeconds` must be an integer in the range `1..86400` (1 second to 24 hours).
 - Omitted `idleTimeoutSeconds` means provider default.
 
 ## Pool Schema
@@ -246,9 +253,10 @@ The request body is first validated against the OpenAPI schema. Schema or field-
 Create and update validation must enforce all of the following:
 
 - `organizationId`, `projectId`, `regionId`, and `networkId` remain immutable after create.
+- The referenced `networkId` must share the same organisational scope root as the load balancer (co-location constraint per [SPECIFICATION.md §5.10](../../SPECIFICATION.md)). Reject with `422 unprocessable_content` if not.
 - Listener names satisfy the documented format and uniqueness rules.
 - Listener ports and member ports are integers in the range `1..65535`.
-- `idleTimeoutSeconds`, when present, is an integer greater than or equal to `1`.
+- `idleTimeoutSeconds`, when present, is an integer in the range `1..86400`.
 - Health-check intervals and timeouts are integers greater than or equal to `1`.
 - Health-check thresholds are integers in the range `1..10`.
 - `proxyProtocolV2=true` is rejected for `udp`.
@@ -260,29 +268,83 @@ Create and update validation must enforce all of the following:
 - Duplicate `(address, port)` members in the same pool are rejected.
 - Member addresses are not validated for reachability at submission time. Network-layer reachability is the caller's responsibility.
 
+Update operations use optimistic locking via `MergeFromWithOptimisticLock` per [SPECIFICATION.md §7.3](../../SPECIFICATION.md). If the resource version has advanced since the client last read the resource, the write is rejected with `409 conflict`.
+
 Preferred response behavior:
 
 | Condition | Preferred response |
 |---|---|
 | Invalid IPv4 CIDR syntax in `allowedCidrs`, invalid listener name format, invalid member `address`, or out-of-range numeric field values | `400 invalid_request` |
+| Authentication failure or expired token | `401 access_denied` |
+| Authenticated principal lacks permission, or quota exhausted | `403 forbidden` |
+| Resource not found on GET, PUT, or DELETE | `404 not_found` |
+| Write conflict on PUT (resource version advanced) | `409 conflict` |
 | Unsupported field combinations such as `proxyProtocolV2=true` on `udp` or `idleTimeoutSeconds` on `udp` | `422 unprocessable_content` |
+| Co-location constraint violation (`networkId` not in same organisational scope) | `422 unprocessable_content` |
 | `timeoutSeconds >= intervalSeconds` | `422 unprocessable_content` |
 | Duplicate listener names, duplicate `(protocol, port)` listeners, or duplicate `(address, port)` members in one pool | `422 unprocessable_content` |
+| Unexpected internal error | `500 server_error` |
 
-## Cross-Service Semantics
+All error responses follow the standard platform error body format (`error`, `error_description`, `trace_id`) per [SPECIFICATION.md §7.9](../../SPECIFICATION.md). The `PUT` endpoint must advertise `409` in the OpenAPI spec per [SPECIFICATION.md §7.3](../../SPECIFICATION.md).
+
+## Resource Graph
+
+### Edge Declarations
+
+Per [SPECIFICATION.md §5.10](../../SPECIFICATION.md), the LoadBalancer resource type declares the following edge:
+
+| Edge | Type | Properties |
+|---|---|---|
+| LoadBalancer → Network | Dependency | Reverse Deletion Propagation (triggering) + Status Propagation Upward + Co-location Required |
+
+This is an intra-service edge (both resources are owned by the Region service). No blocking reference is placed on the Network per the Dependency edge contract ([SPECIFICATION.md §5.7](../../SPECIFICATION.md)).
 
 ### Network Dependency
 
-- `networkId` establishes a dependency edge from the load balancer to the consumed Region `Network`.
-- If the referenced network enters `DELETING`, Region must initiate deletion of the dependent load balancer.
-- The network is not blocked by the load balancer. Deleting the network triggers load balancer deletion instead of being rejected.
+- `networkId` establishes a dependency edge from the load balancer to the Region `Network`.
+- If the referenced network enters `DELETING`, the controller must initiate deletion of the dependent load balancer. The network is not blocked by the load balancer.
+- The controller registers a Kubernetes watch on the Network resource type (intra-service edge per [SPECIFICATION.md §8.6](../../SPECIFICATION.md)) to detect the network's deletion timestamp and trigger load balancer deletion.
+- When the Network's status changes, the controller re-derives the load balancer's status from the aggregate state of connected targets (status propagation upward per [SPECIFICATION.md §5.8](../../SPECIFICATION.md)). If the Network becomes unavailable, the load balancer reflects this in its own conditions.
 
 ### Member Address Semantics
 
-- Members are specified by IPv4 address. There is no cross-service dependency on compute instances.
+- Members are specified by IPv4 address. There is no edge relationship or cross-service dependency on compute instances.
 - The load balancer does not validate member address reachability at submission time.
 - With `healthCheck` enabled, provider health monitoring will detect and remove unreachable backends from rotation.
 - Without `healthCheck`, traffic may be attempted to unreachable backends until the client updates the member list.
+
+### Owned Resources
+
+[SPECIFICATION.md §2.1](../../SPECIFICATION.md) must be updated to include `LoadBalancer` in the Region service's owned resources table.
+
+## Handler Semantics
+
+The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
+
+- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler creates the `LoadBalancer` CRD as the terminal write. If quota is enforced in a future version, the handler must use a saga with a soft reservation step and compensating transaction per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md).
+- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`.
+- **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
+
+All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.md §9.2](../../SPECIFICATION.md).
+
+## Controller Lifecycle
+
+### Finalizer
+
+The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work. On deletion, the controller detects the deletion timestamp, retries silently while owned children or references exist, runs full deprovisioning (including all provider resources), and removes the finalizer only after deprovisioning completes per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
+
+### Deadlock Detection
+
+On every reconcile pass of a load balancer in `DELETING` state, the controller checks the age of the deletion timestamp. If the timestamp exceeds 10 minutes and inbound references are still present, the controller emits a structured zap log entry with: resource type, resource ID, deletion timestamp, elapsed duration, and the full set of blocking reference strings as discrete structured fields per [SPECIFICATION.md §8.8](../../SPECIFICATION.md).
+
+## Observability
+
+The load balancer API handlers and controller follow the platform observability requirements in [SPECIFICATION.md §9](../../SPECIFICATION.md):
+
+- **Structured logging**: the controller logs every reconcile pass, state transition, reference operation, and requeue decision with resource type and resource ID as structured zap fields. API handlers log on non-2xx responses only.
+- **Audit logging**: all authenticated, scoped, state-mutating API operations (POST, PUT, DELETE) emit `msg: audit` entries at info level with the required fields (actor, operation, scope, resource, result).
+- **Distributed tracing**: a span is created for every inbound API request and every controller reconcile pass. The trace ID is included in all non-2xx error responses.
+- **Metrics**: the controller emits reconcile duration (histogram), reconcile outcome (counter), work queue depth (gauge), and reference operation count (counter). API handlers emit request duration (histogram) and request count (counter), both by endpoint and status class.
 
 ## Defaults and Derived Behavior
 
@@ -300,3 +362,10 @@ The initial public behavior is:
 - The implementation is IPv4-only.
 
 Provider-specific protocol, health-monitor, timeout, and persistence mapping is defined in [OpenStack Load Balancers](../providers/openstack/load-balancers.md).
+
+## Open Questions
+
+- Should quota enforcement be included in v1, or is deferral acceptable for initial launch? If deferred, what is the target milestone?
+- Should there be maximum limits on the number of listeners, members per pool, or `allowedCidrs` entries per listener? Octavia may impose its own limits that should be surfaced.
+- When a load balancer has zero members and Octavia reports `ACTIVE` with a VIP, the condition is `ConditionReasonProvisioning`. Should the platform condition vocabulary be extended to distinguish "provisioned but not operational" from "provisioning in progress"?
+- When `region.features.loadBalancers` is `false` for a region, should the endpoints return `404` (region has no LB capability) or `422` (feature not enabled)?
