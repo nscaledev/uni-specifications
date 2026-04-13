@@ -283,14 +283,12 @@ All error responses follow the standard platform error body format (`error`, `er
 
 ## Quota Semantics
 
-Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcement for load balancer count.
+Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcement for both load balancer count and public IP allocation. The quota kind for public IPs is `publicips`, which is a shared quota defined in `uni-identity` (default: 5) and consumed by all services that allocate public IPs (compute instances, load balancers, etc.).
 
-- Create reserves `1` load balancer quota unit keyed by the load balancer resource UUID before returning `202 Accepted`. If quota is exhausted, the handler returns `403 forbidden`.
-- Successful provisioning promotes that reservation to a committed allocation.
-- Update does not change quota consumption. This spec does not quota-track `publicIP`, so toggling it does not consume or release load balancer quota.
-- Delete releases the committed allocation, or any still-active reservation, before the controller removes its finalizer.
-
-Shared floating-IP/public-IP quota is a cross-resource concern spanning instances and load balancers. It must be specified once at the platform level for all consumers and is intentionally not defined in this resource-specific v1 document.
+- **Create**: the saga reserves `1` `loadbalancers` quota unit keyed by the load balancer resource UUID. If `spec.publicIP=true`, the saga also reserves `1` `publicips` unit keyed by the same UUID. If either quota is exhausted, the handler returns `403 forbidden`.
+- Successful provisioning promotes both reservations to committed allocations.
+- **Update**: if `publicIP` changes from `false` to `true`, the handler updates the allocation to add `1` `publicips` unit (quota check applies; `403 forbidden` if exhausted). If `publicIP` changes from `true` to `false`, the handler updates the allocation to remove the `publicips` unit. Changes to `publicIP` do not affect the `loadbalancers` quota.
+- **Delete**: releasing the committed allocation covers both `loadbalancers` and `publicips` (whichever was committed) before the controller removes its finalizer.
 
 ## Resource Graph
 
@@ -328,8 +326,8 @@ This is an intra-service edge (both resources are owned by the Region service). 
 
 The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
 
-- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with a soft reservation step for `1` load balancer quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If quota is exhausted, it returns `403 forbidden`.
-- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. Updates do not change quota consumption because only load balancer count is quota-tracked here.
+- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If either quota is exhausted, it returns `403 forbidden`.
+- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. If `publicIP` toggles from `false` to `true`, the handler checks `publicips` quota and returns `403 forbidden` if exhausted, then updates the allocation to add the `publicips` unit. If `publicIP` toggles from `true` to `false`, the handler updates the allocation to remove the `publicips` unit.
 - **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
 
 All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.md §9.2](../../SPECIFICATION.md).

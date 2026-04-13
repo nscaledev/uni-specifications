@@ -156,7 +156,7 @@ On deletion:
 1. The controller detects the deletion timestamp on the `LoadBalancer` resource.
 2. While inbound references or owned children exist, the controller retries silently (`ErrYield`).
 3. The controller calls `DeleteLoadBalancer`, which fully tears down all Octavia resources (listeners, pools, members, health monitors, the load balancer itself) and detaches and deletes any Neutron floating IP.
-4. The controller releases any outbound references (none in the current design, since the Network edge is a dependency, not a consumption) and releases the committed load balancer quota allocation or any still-active reservation.
+4. The controller releases any outbound references (none in the current design, since the Network edge is a dependency, not a consumption) and releases the committed quota allocations (`loadbalancers` and, if `publicIP=true`, `publicips`) or any still-active reservations.
 5. Only after all provider resources, quota state, and references are cleaned up does the controller remove the finalizer.
 
 ## Downstream Error Handling
@@ -207,8 +207,6 @@ This provider mapping does not include:
 - Mixed IPv4 and IPv6 members
 - Additional VIPs
 - Listener connection limits
-
-Floating-IP/public-IP quota is also out of scope for this document because that quota is shared across resource types, including instances, and must be defined once at the platform level.
 
 ## Acceptance Criteria
 
@@ -261,4 +259,9 @@ Implementation handoff must include tests that cover:
 - Verify the controller finalizer prevents premature garbage collection during deprovisioning.
 - Verify RBAC enforcement for the `region:loadbalancers:v2` scope on all endpoints.
 
-Do not add a load-balancer-only floating-IP/public-VIP quota test in this version. That quota remains a shared platform-level follow-up across instances and load balancers.
+- Create with `publicIP=true` within `publicips` quota — succeeds.
+- Create with `publicIP=true` when `publicips` quota is exhausted — `403 forbidden`.
+- Update `publicIP` from `false` to `true` within `publicips` quota — succeeds.
+- Update `publicIP` from `false` to `true` when `publicips` quota is exhausted — `403 forbidden`.
+- Update `publicIP` from `true` to `false` — releases the `publicips` allocation.
+- Delete with `publicIP=true` — releases both `loadbalancers` and `publicips` allocations.
