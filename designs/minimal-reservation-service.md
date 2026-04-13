@@ -540,4 +540,4 @@ The reservation service is a standalone binary with its own CRDs, API, and deplo
 
 6. **Rack membership data source (blocking):** The Reservation creation algorithm requires grouping candidate hosts by rack. The OpenStack Placement API returns individual resource providers (Ironic node UUIDs) with no rack grouping. A source of rack membership per node must be confirmed before the Reservation controller can be implemented — candidates: Ironic node traits, nested resource providers in OpenStack Placement, or an operator-maintained topology ConfigMap.
 
-7. **Unreserved Placements:** The two-level model makes `ReservationID` a required field on a Placement. The previous design allowed Placements against the open pool. Should unreserved Placements remain permitted as a fallback, or is a Reservation now always required?
+7. **Unreserved Placements:** The two-level model makes `ReservationID` a required field on a Placement (`OpenStackPlacementSpec.ReservationID string`). The previous design allowed Placements against the open pool. Should unreserved Placements remain permitted as a fallback (making `ReservationID` optional), or is a Reservation now always required?
