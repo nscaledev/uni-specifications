@@ -92,7 +92,7 @@ type OpenStackReservationSpec struct {
 }
 
 type OpenStackReservationStatus struct {
-    // RackIDs is the confirmed set of Ironic node UUIDs for the reserved racks.
+    // RackIDs is the confirmed set of rack identifiers reserved for this Reservation.
     // Set atomically at creation; immutable thereafter.
     RackIDs []string
     // LocalityLevel is the highest hierarchy level at which locality was achieved.
