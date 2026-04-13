@@ -18,6 +18,7 @@ The first public abstraction is intentionally narrow:
 - Listener protocols limited to `tcp` and `udp`
 - Listener-scoped `allowedCidrs`
 - Top-level `publicIP`
+- Optional create-time selection of the primary internal VIP
 - Backend members specified by IPv4 address
 - Per-member backend port
 - Optional transport-level health checks only
@@ -38,8 +39,7 @@ The following are explicitly not part of v1:
 - IPv6 VIPs or members
 - Mixed IPv4 and IPv6 members
 - Additional VIPs
-- User-specified VIP addresses
-- Kubernetes `spec.loadBalancerIP`-style workflows
+- VIP changes after create
 - Listener connection limits
 
 Terminated TLS is intentionally excluded in v1 so Kubernetes and CCM-managed workloads retain end-to-end TLS and, where used, client-certificate visibility at the workload. Regions that expose this API are assumed to provide Octavia/Amphora support; unsupported regions are out of scope rather than modeled as a discoverable per-region capability flag.
@@ -112,6 +112,7 @@ The standard Region v2 envelope applies. This section defines the `spec` and `st
 | `projectId` | yes | Owning project. Immutable after create. |
 | `regionId` | yes | Target region. Immutable after create. |
 | `networkId` | yes | Tenant network used for the VIP subnet and backend member resolution. Immutable after create. |
+| `vipAddress` | no | Requested primary internal IPv4 VIP on the load balancer tenant network. Omit to preserve current provider auto-allocation behavior. |
 | `publicIP` | no | When `true`, request a public IPv4 address for the VIP. |
 | `listeners` | yes | Listener definitions. |
 
@@ -132,18 +133,21 @@ The standard Region v2 envelope applies. This section defines the `spec` and `st
 |---|---|---|
 | `regionId` | yes | Region the load balancer is running in. |
 | `networkId` | yes | Tenant network backing the VIP and member reachability. |
-| `vipAddress` | no | VIP address allocated for the load balancer. |
+| `vipAddress` | no | Actual VIP address allocated for the load balancer. |
 | `publicIP` | no | Public IPv4 address attached to the VIP when enabled. |
 | `conditions` | yes | Standard platform `status.conditions`. |
 
 Rules:
 
 - `organizationId`, `projectId`, `regionId`, and `networkId` are immutable after create.
+- `vipAddress` is optional on create. When omitted, the provider allocates the private VIP exactly as it does today.
+- `vipAddress` is create-only. Because it is absent from `LoadBalancerV2Spec`, `PUT` cannot create, change, or clear the requested VIP.
 - `publicIP` is mutable.
 - `networkId` is the required backend network. All member addresses must be reachable on this network.
 - `spec.publicIP` requests a public VIP address and `status.publicIP` reports the allocated public IPv4. This intentionally matches the existing instance API naming convention.
+- `status.vipAddress` reports the actual allocated VIP for the load balancer.
+- If create succeeds with `spec.vipAddress` set, `status.vipAddress` must equal the requested value.
 - `status.vipAddress` is stable for the lifetime of the load balancer. Once allocated, the VIP does not change.
-- There is no `vipAddress` request field in create or update. Callers cannot request a specific VIP or private address in v1, so Kubernetes `spec.loadBalancerIP`-style workflows are unsupported.
 - `Available=True` must not be reported until `status.vipAddress` is populated.
 - The public status surface is provider-agnostic. Provider IDs, per-listener operating status, per-member health, statistics, the algorithm, the status tree, and driver names are not exposed in v1.
 
@@ -242,11 +246,13 @@ Health-check rules:
 
 ## Validation and Error Semantics
 
-The request body is first validated against the OpenAPI schema. Schema or field-format failures should return `400 invalid_request`. Cross-field or cross-resource semantic failures should return `422 unprocessable_content`.
+The request body is first validated against the OpenAPI schema. Schema or field-format failures, including malformed `vipAddress`, should return `400 invalid_request`. Cross-field or cross-resource semantic failures should return `422 unprocessable_content`.
 
 Create and update validation must enforce all of the following:
 
 - `organizationId`, `projectId`, `regionId`, and `networkId` remain immutable after create.
+- `vipAddress`, when present in `LoadBalancerV2CreateSpec`, must be a valid IPv4 address.
+- `vipAddress` must not be accepted on `PUT`. Because `LoadBalancerV2Spec` excludes the field, any `PUT` body containing `vipAddress` is schema-invalid and returns `400 invalid_request`.
 - The referenced `networkId` must share the same organisational scope root as the load balancer (co-location constraint per [SPECIFICATION.md §5.10](../../SPECIFICATION.md)). Reject with `422 unprocessable_content` if not.
 - Listener names satisfy the documented format and uniqueness rules.
 - Listener ports and member ports are integers in the range `1..65535`.
@@ -262,17 +268,22 @@ Create and update validation must enforce all of the following:
 - Duplicate `(address, port)` members in the same pool are rejected.
 - Member addresses are not validated for reachability at submission time. Network-layer reachability is the caller's responsibility.
 
+If `vipAddress` is set, reconcile must either allocate that exact VIP or fail the resource. It must never substitute a different private VIP when a specific internal VIP was requested.
+
+Because writes are asynchronous, a create request with a syntactically valid but unusable `vipAddress` still returns `202 Accepted` if it passes request-time validation. If allocation later fails because the requested address is off-network, already in use, unavailable, or otherwise rejected by the provider, reconcile sets `Available=False` with reason `ConditionReasonErrored`. `status.vipAddress` remains empty until the exact requested VIP is actually allocated.
+
 Update operations use optimistic locking via `MergeFromWithOptimisticLock` per [SPECIFICATION.md §7.3](../../SPECIFICATION.md). If the resource version has advanced since the client last read the resource, the write is rejected with `409 conflict`.
 
 Preferred response behavior:
 
 | Condition | Preferred response |
 |---|---|
-| Invalid IPv4 CIDR syntax in `allowedCidrs`, invalid listener name format, invalid member `address`, or out-of-range numeric field values | `400 invalid_request` |
+| Invalid `vipAddress` syntax, invalid IPv4 CIDR syntax in `allowedCidrs`, invalid listener name format, invalid member `address`, or out-of-range numeric field values | `400 invalid_request` |
 | Authentication failure or expired token | `401 access_denied` |
 | Authenticated principal lacks permission, or quota exhausted | `403 forbidden` |
 | Resource not found on GET, PUT, or DELETE | `404 not_found` |
 | Write conflict on PUT (resource version advanced) | `409 conflict` |
+| `vipAddress` present in a `PUT` body | `400 invalid_request` |
 | Unsupported field combinations such as `proxyProtocolV2=true` on `udp` or `idleTimeoutSeconds` on `udp` | `422 unprocessable_content` |
 | Co-location constraint violation (`networkId` not in same organisational scope) | `422 unprocessable_content` |
 | `timeoutSeconds >= intervalSeconds` | `422 unprocessable_content` |
@@ -283,7 +294,7 @@ All error responses follow the standard platform error body format (`error`, `er
 
 ## Quota Semantics
 
-Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcement for both load balancer count and public IP allocation. The quota kind for public IPs is `publicips`, which is a shared quota defined in `uni-identity` (default: 5) and consumed by all services that allocate public IPs (compute instances, load balancers, etc.).
+Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcement for both load balancer count and public IP allocation. The quota kind for public IPs is `publicips`, which is a shared quota defined in `uni-identity` (default: 5) and consumed by all services that allocate public IPs (compute instances, load balancers, etc.). Requested internal VIPs do not introduce a new quota kind and do not change existing `loadbalancers` or `publicips` accounting.
 
 - **Create**: the saga reserves `1` `loadbalancers` quota unit keyed by the load balancer resource UUID. If `spec.publicIP=true`, the saga also reserves `1` `publicips` unit keyed by the same UUID. If either quota is exhausted, the handler returns `403 forbidden`.
 - Successful provisioning promotes both reservations to committed allocations.
@@ -320,14 +331,14 @@ This is an intra-service edge (both resources are owned by the Region service). 
 
 ### Owned Resources
 
-[SPECIFICATION.md §2.1](../../SPECIFICATION.md) must be updated to include `LoadBalancer` in the Region service's owned resources table.
+[SPECIFICATION.md §2.1](../../SPECIFICATION.md) includes `LoadBalancer` in the Region service's owned resources table.
 
 ## Handler Semantics
 
 The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
 
-- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If either quota is exhausted, it returns `403 forbidden`.
-- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. If `publicIP` toggles from `false` to `true`, the handler checks `publicips` quota and returns `403 forbidden` if exhausted, then updates the allocation to add the `publicips` unit. If `publicIP` toggles from `true` to `false`, the handler updates the allocation to remove the `publicips` unit.
+- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If `spec.vipAddress` is present, the handler persists it as a distinct immutable internal field (for example `requestedVipAddress`) on the backing resource so reconcile can replay the same provider request idempotently across retries and restarts. If either quota is exhausted, it returns `403 forbidden`.
+- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. `vipAddress` is intentionally absent from `LoadBalancerV2Spec`; any `PUT` body containing it fails schema validation with `400 invalid_request`. If `publicIP` toggles from `false` to `true`, the handler checks `publicips` quota and returns `403 forbidden` if exhausted, then updates the allocation to add the `publicips` unit. If `publicIP` toggles from `true` to `false`, the handler updates the allocation to remove the `publicips` unit.
 - **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
 
 All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.md §9.2](../../SPECIFICATION.md).
@@ -356,6 +367,8 @@ The load balancer API handlers and controller follow the platform observability 
 The initial public behavior is:
 
 - `publicIP` is top-level on the load balancer spec.
+- Omitted `vipAddress` preserves current provider auto-allocation behavior for the primary internal VIP.
+- `vipAddress`, when supplied on create, selects only the primary internal VIP and remains immutable after create.
 - `allowedCidrs` is listener-scoped.
 - `proxyProtocolV2` is v2-only, TCP-only, and defaults to `false`.
 - `healthCheck` object presence means enabled.

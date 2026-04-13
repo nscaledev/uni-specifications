@@ -24,6 +24,8 @@ Terminated TLS remains out of scope so Kubernetes and CCM-managed workloads reta
 
 Regions that expose this API are assumed to provide Octavia with the Amphora driver. Unsupported regions are out of scope for this version rather than modeled as a discoverable feature flag.
 
+This version assumes Octavia load balancer create supports `vip_address` together with `vip_network_id`, and that VIP mutation is not supported as part of load balancer update.
+
 OVN compatibility is explicitly out of scope for this version, since OVN does not support VLANs currently.
 
 ## Resource Mapping
@@ -36,11 +38,13 @@ The public abstraction maps to Octavia and Neutron as follows:
 | One Region listener | One Octavia listener |
 | One Region pool | One Octavia pool |
 | One Region member | One Octavia member using the specified member address and configured member port |
+| `networkId` | Octavia load balancer `vip_network_id` and backend member reachability |
+| `vipAddress` on create | Octavia load balancer create `vip_address` |
 | `publicIP=true` | One Neutron floating IP attached to the VIP port |
 | Listener `allowedCidrs` | Octavia listener allowed-CIDRs feature (`allowed_cidrs` API field) |
 | Hidden public algorithm | Octavia `ROUND_ROBIN` |
 
-`networkId` is the tenant network used for both the VIP subnet selection and backend member reachability.
+`networkId` is the tenant network used for both VIP subnet selection and backend member reachability. When `spec.vipAddress` is set, the provider still derives only `vip_network_id` from `networkId`; this change does not add a public or internal `subnetId` requirement. `publicIP=true` remains compatible with `vipAddress`: the floating IP attaches to the VIP port of the requested internal VIP once that VIP is allocated.
 
 ## Protocol and Health-Monitor Mapping
 
@@ -81,8 +85,10 @@ Provider contract:
 - `CreateLoadBalancer` is the idempotent reconcile entrypoint for both create and update.
 - `DeleteLoadBalancer` fully tears down all provider resources, including floating IPs.
 - `UpdateLoadBalancerState` refreshes derived status such as VIP and public IP.
+- The Region-owned load balancer model may persist a distinct immutable `requestedVipAddress` field. This is internal Region state, not a provider-owned persistence object or public API field.
+- The in-process provider model passed to `CreateLoadBalancer` includes `requestedVipAddress` when set so reconcile remains idempotent across retries and restarts.
 
-No provider-specific persistence CRD or stored "last applied" snapshot is used. Reconcile rediscovers provider resources from live Octavia and Neutron state on every pass.
+No provider-specific persistence CRD or stored "last applied" snapshot is used. Reconcile rediscovers provider resources from live Octavia and Neutron state on every pass, using the Region-owned immutable `requestedVipAddress` as part of desired input when present.
 
 Live discovery uses deterministic names and identities:
 
@@ -99,6 +105,8 @@ The OpenStack provider implementation must satisfy the following behavior:
 
 - Provider-side reconcile is idempotent across repeated calls and controller restarts. Every reconcile pass discovers the live Octavia and Neutron objects for the load balancer by deterministic name or identity and resumes from the observed provider state.
 - Desired state is always diffed against live Octavia and Neutron state, never against stored "last applied" state.
+- When a stored `requestedVipAddress` is present, load balancer creation must pass it to Octavia as `vip_address` together with the existing `vip_network_id` derived from `networkId`.
+- If `requestedVipAddress` is present, reconcile must either allocate that exact VIP or surface a genuine error. It must never accept or allocate a different private VIP as fallback.
 - Listener reconciliation is keyed by stable public `listener.name`.
 - A listener rename is handled as delete-and-create of the provider listener and pool subtree.
 - Changing a listener's `protocol` or `port` while keeping the same `listener.name` is reconciled as an in-place Octavia listener update, not as delete-and-create.
@@ -107,6 +115,8 @@ The OpenStack provider implementation must satisfy the following behavior:
 - Health monitor create, delete, and parameter updates are reconciled in place.
 - Member sets and member ports are updated in place.
 - `proxyProtocolV2` changes for TCP listeners are reconciled without changing the public resource contract.
+- Updates to listeners or `publicIP` preserve the existing VIP. Reconcile does not attempt VIP mutation on update.
+- If live provider state is rediscovered with a VIP different from stored `requestedVipAddress`, the provider treats this as permanent drift and surfaces `ConditionReasonErrored` rather than silently accepting or recreating.
 - Toggling `publicIP` attaches or detaches the Neutron floating IP from the VIP port discovered for the load balancer VIP.
 
 ## Public Status Exposure
@@ -118,6 +128,8 @@ The Region API exposes only provider-agnostic status fields:
 - `status.vipAddress`
 - `status.publicIP`
 - Standard `status.conditions`
+
+There is no public or status `requestedVipAddress` field. `status.vipAddress` continues to report only the actual allocated VIP.
 
 The following are not exposed in v1:
 
@@ -139,11 +151,14 @@ Every reconcile pass, successful or not, must update the `Available` condition b
 |---|---|---|---|
 | `PENDING_CREATE` or `PENDING_UPDATE` | `Available=False` with reason `ConditionReasonProvisioning` | `ErrYield` | Fixed interval requeue |
 | `PENDING_DELETE` or local delete flow | `Available=False` with reason `ConditionReasonDeprovisioning` | `ErrYield` | Fixed interval requeue |
-| `ACTIVE` with at least one effective backend and `status.vipAddress` populated | `Available=True` with reason `ConditionReasonProvisioned` | `nil` | Removed from queue |
+| `ACTIVE` with at least one effective backend, `status.vipAddress` populated, and either no stored `requestedVipAddress` or `status.vipAddress == requestedVipAddress` | `Available=True` with reason `ConditionReasonProvisioned` | `nil` | Removed from queue |
+| `ACTIVE` with stored `requestedVipAddress` but a different live VIP | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | `ERROR` | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | Zero members or zero effective backends | `Available=False` with reason `ConditionReasonProvisioning` | `ErrYield` | Fixed interval requeue |
 
 The zero-members case uses `ConditionReasonProvisioning` because the load balancer is not yet fully operational, even though the Octavia LB itself may be `ACTIVE` with a VIP allocated. This is the best-fit standard reason within the platform's condition vocabulary. Callers should not interpret `ConditionReasonProvisioning` as necessarily meaning infrastructure provisioning is in progress.
+
+When a requested VIP is configured, `status.vipAddress` remains empty until Octavia reports that exact address as the live VIP. A provider rejection of the requested VIP is surfaced as `ConditionReasonErrored`; the implementation must not fall back to a different private VIP.
 
 If the status write itself fails (e.g., resource version conflict), the controller requeues with a fixed timeout and does not return an error (status write failure is transient per [SPECIFICATION.md §8.4](../../../SPECIFICATION.md)).
 
@@ -166,7 +181,8 @@ When the controller receives error responses from Octavia or Neutron API calls, 
 | Octavia/Neutron response | Treatment |
 |---|---|
 | 5xx or service unavailable | Transient. Return `ErrYield`, retry at fixed interval. |
-| 409 conflict (e.g., Octavia `IMMUTABLE`) | Transient. Re-read provider state and retry at fixed interval. |
+| 400 or 409 while satisfying a requested `vip_address` (for example off-network, validation failure, or permanent address-allocation conflict) | Genuine error. Surface as `ConditionReasonErrored`. A requested VIP that cannot be satisfied must not fall back to another private VIP. |
+| 409 conflict unrelated to a requested VIP (for example Octavia `IMMUTABLE`) | Transient. Re-read provider state and retry at fixed interval. |
 | 404 on a resource the controller expects to exist | Genuine error. Surface as `ConditionReasonErrored`. Data inconsistency that will not resolve on retry. |
 | 403 | Genuine error. Surface as `ConditionReasonErrored`. Permission failure will not resolve without intervention. |
 | 401 | Transient for a bounded number of retries (credential refresh). If persistent, surface as `ConditionReasonErrored`. |
@@ -206,6 +222,8 @@ This provider mapping does not include:
 - IPv6 members
 - Mixed IPv4 and IPv6 members
 - Additional VIPs
+- VIP mutation after create
+- Public or internal `subnetId` selection for VIP placement
 - Listener connection limits
 
 ## Acceptance Criteria
@@ -215,9 +233,12 @@ Implementation handoff must include tests that cover:
 - List by `tag` and verify the filter matches the public API representation of tags at `metadata.tags`.
 - Verify the load balancer public API does not expose a load-balancer-specific `spec.tags` field.
 - Verify any backing Region CRD persistence of tags is treated as internal and does not affect API semantics.
+- Create without `vipAddress` and verify behavior is unchanged from provider auto-allocation today.
 - Create a private TCP load balancer with one or more IP-address members.
 - Create a private UDP load balancer with one or more IP-address members.
+- Create a private load balancer with a valid `vipAddress` and verify `status.vipAddress` equals the requested value.
 - Create a public load balancer with `publicIP=true`.
+- Create a public load balancer with `publicIP=true` and a valid `vipAddress`, and verify the requested internal VIP is preserved and the floating IP attaches to it.
 - Create within the load balancer quota and verify success.
 - Reject create over the load balancer quota with `403 forbidden`.
 - Delete a load balancer and verify the load balancer quota allocation is released.
@@ -241,19 +262,25 @@ Implementation handoff must include tests that cover:
 - Create, remove, and update a health monitor in place.
 - Update `proxyProtocolV2` in place for TCP listeners.
 - Update `publicIP` in place.
+- Verify updates to listeners and `publicIP` do not change a successfully allocated requested VIP.
 - Reject duplicate listener names.
 - Reject duplicate `(protocol, port)` listeners.
 - Reject invalid CIDRs.
+- Reject malformed `vipAddress` with `400 invalid_request`.
 - Reject a member with an invalid IPv4 address.
 - Reject duplicate `(address, port)` members within one pool.
 - Allow the same address in different pools.
 - Allow the same address with different ports in one pool.
+- Submit a create with a syntactically valid but unusable requested VIP and verify `Available=False` with `ConditionReasonErrored` and no fallback VIP allocation.
 - Verify network deletion triggers load balancer deletion and is not blocked by the load balancer.
 - Verify network deletion while the load balancer controller is down still causes load balancer deletion after restart and reconcile.
 - Verify member address and port updates are reconciled to Octavia in place.
-- Restart the controller after a partial reconcile and verify existing Octavia resources are rediscovered without any provider persistence object.
+- Restart the controller after a partial reconcile and verify existing Octavia resources are rediscovered without any provider persistence object, and that a stored requested VIP is replayed idempotently.
+- Verify live-provider rediscovery does not silently accept drift where the live VIP differs from the stored requested value.
 - Verify Amphora Octavia resources, floating IPs, and references are fully cleaned up on delete.
+- Verify delete cleanup is unchanged for load balancers with and without a requested VIP.
 - Verify `PUT` returns `409 conflict` when the resource version has advanced (conflict detection).
+- Verify `PUT` containing `vipAddress` is rejected with `400 invalid_request`.
 - Verify `DELETE` on an already-deleting resource returns `202` without re-triggering deletion (idempotent delete).
 - Reject load balancer creation when the network is in a different organisational scope (co-location validation returns `422`).
 - Verify the controller finalizer prevents premature garbage collection during deprovisioning.
