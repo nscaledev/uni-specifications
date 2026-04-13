@@ -244,7 +244,7 @@ The controller adds its own finalizer on creation to ensure the deletion path ru
 The controller loads the parent Reservation to constrain the candidate set, queries the OpenStack Placement API for unclaimed hosts, applies spread constraints, then claims the selected hosts.
 
 **Step 0 — Load the parent Reservation.**
-Verify `Status.State == Active`. Collect `Status.RackIDs`. All subsequent candidate enumeration is restricted to hosts whose rack membership is within this set.
+Verify `Status.State == Active`. Collect `Status.RackIDs`. All subsequent candidate enumeration is restricted to hosts whose rack membership is within this set. *(Implementation of rack membership lookup is pending resolution of Q6.)*
 
 **Step 1 — Resolve the resource class from the flavour.**
 The flavour's extra specs contain `resources:CUSTOM_BAREMETAL_LARGE=1` (or equivalent). The controller queries Nova for the flavour and reads the `resources:CUSTOM_*` key to obtain the resource class name.
