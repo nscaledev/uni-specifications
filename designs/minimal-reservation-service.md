@@ -195,6 +195,7 @@ type OpenStackPlacementStatus struct {
 
 **Conditions:**
 - `Allocated` — set True by the controller once hosts have been selected, claimed, and recorded in `Status.HostIDs`. This is the controller's own signal that the Placement has been populated.
+- `HostUnavailable` — set True by the controller when no sufficient set of hosts can be found to satisfy the Placement request. The controller requeues; once hosts become available the condition is cleared and allocation proceeds.
 - Gate conditions (e.g. `ib.unikorn-cloud.org/partition-ready`) — set by external services via the REST API, as named in `Spec.ReadinessGates`.
 - `Ready` — set True by the controller only when `Allocated` is True and every condition named in `Spec.ReadinessGates` is also True.
 
