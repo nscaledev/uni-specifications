@@ -118,10 +118,7 @@ On creation (DeletionTimestamp nil):
    If failure_policy is "hard" and a single scale unit cannot supply
    the requested count, reject with a clean error.
 
-4. Conflict-check: no rack in the candidate set appears in any existing
-   active Reservation.
-
-5. Atomically write Status.RackIDs, Status.LocalityLevel, Status.State = Active.
+4. Atomically write Status.RackIDs, Status.LocalityLevel, Status.State = Active.
    Add controller finalizer.
 ```
 
