@@ -283,7 +283,7 @@ If no sufficient set of hosts is available, the controller sets a `HostUnavailab
 
 External services that perform per-host programming register a deletion block on the Placement while their programming is active. This prevents the hosts from being released and reclaimed before the programming is reversed.
 
-Per the platform spec (section 5.3), references cross service boundaries via the owning service's reference REST API — external services never write another service's finalizers directly. The reservation service exposes `PUT` and `DELETE` reference endpoints; internally it translates these into finalizer operations on its own CRD. The reference string format follows the canonical `{resource}.{group}/{uuid}` scheme produced by `GenerateResourceReference`.
+Per [platform spec §5.3](../SPECIFICATION.md#53-references), references cross service boundaries via the owning service's reference REST API — external services never write another service's finalizers directly. The reservation service exposes `PUT` and `DELETE` reference endpoints; internally it translates these into finalizer operations on its own CRD. The reference string format follows the canonical `{resource}.{group}/{uuid}` scheme produced by `GenerateResourceReference`.
 
 **Lifecycle:**
 
