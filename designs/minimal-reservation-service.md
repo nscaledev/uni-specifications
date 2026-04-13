@@ -84,12 +84,6 @@ type OpenStackReservationSpec struct {
     // LocalityPreference optionally constrains rack selection to minimise
     // the number of scale units spanned.
     LocalityPreference *OpenStackReservationLocalityPreference
-    // NotBefore is a schema stub; no automated transitions yet.
-    NotBefore *metav1.Time
-    // ExpiresAt is a schema stub; no automated transitions yet.
-    ExpiresAt *metav1.Time
-    // ParentReservationID is a schema stub for nested reservations.
-    ParentReservationID string
 }
 
 type OpenStackReservationStatus struct {
