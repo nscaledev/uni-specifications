@@ -8,10 +8,7 @@ The standard Region v2 resource envelope and the platform-wide rules in [SPECIFI
 
 | Version | Date | Notes |
 |---|---|---|
-| v0.4 | 2026-04-12 | Compliance review: formal edge property declaration, authentication classification, conflict detection, co-location validation, finalizer lifecycle, handler semantics, observability, open questions |
-| v0.3 | 2026-04-11 | Members specified by IP address instead of compute-instance reference; Compute-Member Lifecycle cross-service dependency removed; VIP stability and `Available` precondition guarantees added |
-| v0.2 | 2026-04-10 | Review update: empty member sets, dependency-triggered deletion, stale-member tolerance, and clarified validation/status semantics |
-| v0.1 | 2026-04-10 | Initial draft |
+| v0.1 | 2026-04-13 | Initial version |
 
 ## Initial Scope
 

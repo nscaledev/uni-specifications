@@ -8,10 +8,7 @@ The initial provider assumption is Octavia with the Amphora driver. This is an i
 
 | Version | Date | Notes |
 |---|---|---|
-| v0.4 | 2026-04-12 | Compliance review: finalizer lifecycle, downstream error classification, deadlock detection, ErrYield queue semantics, reconciliation recovery, observability, expanded acceptance criteria |
-| v0.3 | 2026-04-11 | Members use IP addresses directly; removed compute-instance lifecycle reconciliation; `Available=True` requires `status.vipAddress` populated |
-| v0.2 | 2026-04-10 | Review update: listener-name identity, dependency-triggered deletion, stale-member withdrawal, and clarified status mapping |
-| v0.1 | 2026-04-10 | Initial draft |
+| v0.1 | 2026-04-13 | Initial version |
 
 ## Scope and Assumptions
 
