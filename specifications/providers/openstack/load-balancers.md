@@ -129,7 +129,7 @@ The following are not exposed in v1:
 
 For status derivation, an effective backend is a member that has been successfully provisioned as an Octavia pool member.
 
-Every reconcile pass, successful or not, must update the `Available` condition before returning. This is unconditional per [SPECIFICATION.md §8.4](../../SPECIFICATION.md).
+Every reconcile pass, successful or not, must update the `Available` condition before returning. This is unconditional per [SPECIFICATION.md §8.4](../../../SPECIFICATION.md).
 
 | Octavia or local state | Region condition mapping | Reconcile return | Queue behavior |
 |---|---|---|---|
@@ -141,11 +141,11 @@ Every reconcile pass, successful or not, must update the `Available` condition b
 
 The zero-members case uses `ConditionReasonProvisioning` because the load balancer is not yet fully operational, even though the Octavia LB itself may be `ACTIVE` with a VIP allocated. This is the best-fit standard reason within the platform's condition vocabulary. Callers should not interpret `ConditionReasonProvisioning` as necessarily meaning infrastructure provisioning is in progress.
 
-If the status write itself fails (e.g., resource version conflict), the controller requeues with a fixed timeout and does not return an error (status write failure is transient per [SPECIFICATION.md §8.4](../../SPECIFICATION.md)).
+If the status write itself fails (e.g., resource version conflict), the controller requeues with a fixed timeout and does not return an error (status write failure is transient per [SPECIFICATION.md §8.4](../../../SPECIFICATION.md)).
 
 ## Finalizer Lifecycle
 
-The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
+The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work per [SPECIFICATION.md §8.5](../../../SPECIFICATION.md).
 
 On deletion:
 
@@ -157,7 +157,7 @@ On deletion:
 
 ## Downstream Error Handling
 
-When the controller receives error responses from Octavia or Neutron API calls, it classifies them per [SPECIFICATION.md §8.7](../../SPECIFICATION.md):
+When the controller receives error responses from Octavia or Neutron API calls, it classifies them per [SPECIFICATION.md §8.7](../../../SPECIFICATION.md):
 
 | Octavia/Neutron response | Treatment |
 |---|---|
@@ -167,19 +167,19 @@ When the controller receives error responses from Octavia or Neutron API calls, 
 | 403 | Genuine error. Surface as `ConditionReasonErrored`. Permission failure will not resolve without intervention. |
 | 401 | Transient for a bounded number of retries (credential refresh). If persistent, surface as `ConditionReasonErrored`. |
 
-The controller must not poll Octavia to check whether dependent resources are ready. Dependency readiness is inferred from local status conditions via status propagation upward per [SPECIFICATION.md §8.7](../../SPECIFICATION.md).
+The controller must not poll Octavia to check whether dependent resources are ready. Dependency readiness is inferred from local status conditions via status propagation upward per [SPECIFICATION.md §8.7](../../../SPECIFICATION.md).
 
 ## Deadlock Detection
 
-On every reconcile pass of a load balancer in `DELETING` state, the controller checks the age of the deletion timestamp. If the timestamp has been set for longer than 10 minutes and inbound references are still present, the controller emits a structured zap error log entry per [SPECIFICATION.md §8.8](../../SPECIFICATION.md).
+On every reconcile pass of a load balancer in `DELETING` state, the controller checks the age of the deletion timestamp. If the timestamp has been set for longer than 10 minutes and inbound references are still present, the controller emits a structured zap error log entry per [SPECIFICATION.md §8.8](../../../SPECIFICATION.md).
 
 The log entry must include as discrete structured zap fields (indexable in Loki): resource type (`LoadBalancer`), resource ID, deletion timestamp, elapsed duration, and the full set of blocking reference strings.
 
 ## Observability
 
-The controller follows the platform observability requirements in [SPECIFICATION.md §9](../../SPECIFICATION.md):
+The controller follows the platform observability requirements in [SPECIFICATION.md §9](../../../SPECIFICATION.md):
 
-- **Structured logging**: every reconcile pass, state transition (Octavia state changes, floating IP attach/detach), reference operation, and requeue decision is logged with resource type and resource ID as structured zap fields. Verbose controller logging per [SPECIFICATION.md §9.1](../../SPECIFICATION.md).
+- **Structured logging**: every reconcile pass, state transition (Octavia state changes, floating IP attach/detach), reference operation, and requeue decision is logged with resource type and resource ID as structured zap fields. Verbose controller logging per [SPECIFICATION.md §9.1](../../../SPECIFICATION.md).
 - **Distributed tracing**: a span is created for every controller reconcile pass. Outbound calls to Octavia and Neutron propagate trace context.
 - **Metrics**: the controller emits reconcile duration (histogram), reconcile outcome (counter by success/transient/error), work queue depth (gauge), and reference operation count (counter by add/remove and outcome). Metric names follow Prometheus conventions: `snake_case`, service-prefixed, with unit suffixes.
 

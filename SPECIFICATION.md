@@ -102,7 +102,7 @@ The Nscale Cloud Platform is a cloud-agnostic PaaS for AI/ML workloads. Each ser
 | Service | Role | Owns |
 |---|---|---|
 | Identity | Identity Service | Organisation, Project, User, Group, Role, OAuth2Client |
-| Region | Region Service | Region, CloudIdentity, Network, PhysicalNetwork, ServerGroup |
+| Region | Region Service | Region, CloudIdentity, Network, PhysicalNetwork, ServerGroup, LoadBalancer |
 | Compute | Compute Service | Server |
 | Kubernetes | Kubernetes Service | ClusterManager, Cluster |
 | Core | Core Library | (shared library — no resources) |
