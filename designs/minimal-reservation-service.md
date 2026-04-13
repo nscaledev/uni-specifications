@@ -395,11 +395,13 @@ Region service creates Server
            If False or absent: Server stays pending, requeue
 
     3. Ready == True:
-           Assign a specific host from Status.HostIDs to this Server
-           (assignment tracked in the Server CRD; each host used at most once)
+           Assign a specific host from Status.HostIDs to this Server:
+               Select a host UUID from Status.HostIDs not already present
+               in Spec.HostID of any existing Server in this Placement.
+               Write the chosen UUID to Spec.HostID on the Server CRD.
            POST /compute/v2/servers with:
                os:scheduler_hints:
-                 force_hosts: [assigned-host-uuid]
+                 force_hosts: [Spec.HostID]
 ```
 
 Each server is targeted at a specific pre-selected host. Nova does not perform host selection — it is directed to the named host. Because all pre-boot programming is complete before any server boots, the host is guaranteed to be in the correct state.
