@@ -306,24 +306,9 @@ No references remain
 
 ### Deletion Protocol
 
-Full end-to-end deletion sequence:
+Once all Placements under a Reservation are deleted:
 
 ```
-User deletes Placement
-    │ DeletionTimestamp set
-    ▼
-Event bus fires → gate services receive deletion notification
-    gate service:
-        Reverses per-host programming
-        DELETE .../placements/{id}/references/{ref}
-
-Placement controller (requeued):
-    GetResourceReferences() non-empty?
-        Yes → requeue
-        No  → Remove CUSTOM_UNIKORN_CLAIMED trait from each host
-              Remove controller finalizer
-              Placement removed from etcd
-
 All Placements from Reservation deleted
     │
     ▼
