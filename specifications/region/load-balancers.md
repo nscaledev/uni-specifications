@@ -135,7 +135,7 @@ The standard Region v2 envelope applies. This section defines the `spec` and `st
 |---|---|---|
 | `regionId` | yes | Region the load balancer is running in. |
 | `networkId` | yes | Tenant network backing the VIP and member reachability. |
-| `vipAddress` | yes | VIP address allocated for the load balancer. |
+| `vipAddress` | no | VIP address allocated for the load balancer. |
 | `publicIP` | no | Public IPv4 address attached to the VIP when enabled. |
 | `conditions` | yes | Standard platform `status.conditions`. |
 
