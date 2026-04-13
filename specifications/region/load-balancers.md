@@ -41,7 +41,8 @@ The following are explicitly not part of v1:
 - User-specified VIP addresses
 - Kubernetes `spec.loadBalancerIP`-style workflows
 - Listener connection limits
-- Quota enforcement (deferred; must be addressed before GA per [SPECIFICATION.md §7.6](../../SPECIFICATION.md))
+
+Terminated TLS is intentionally excluded in v1 so Kubernetes and CCM-managed workloads retain end-to-end TLS and, where used, client-certificate visibility at the workload. Regions that expose this API are assumed to provide Octavia/Amphora support; unsupported regions are out of scope rather than modeled as a discoverable per-region capability flag.
 
 ## API Surface
 
@@ -65,17 +66,13 @@ List filters follow existing Region v2 conventions:
 - `networkID`
 - `tag`
 
-The `tag` filter applies generic resource metadata tags inherited from the standard Region v2 envelope. This document does not add a load-balancer-specific `tags` field under `spec`.
+The `tag` filter matches the standard user-facing resource tags exposed at `metadata.tags` in the shared UNI resource envelope and is evaluated post-list per [SPECIFICATION.md §7.8](../../SPECIFICATION.md). This document does not add a load-balancer-specific public `tags` field under `spec`. The backing Region CRD may persist tags at `spec.tags` as an internal implementation detail; that does not change the public API contract.
 
 List results are sorted stably by name for deterministic ordering per [SPECIFICATION.md §7.8](../../SPECIFICATION.md).
 
 RBAC adds the new scope:
 
 - `region:loadbalancers:v2`
-
-Provider capability discovery adds:
-
-- `region.features.loadBalancers: bool`
 
 ## Public Types
 
@@ -201,7 +198,7 @@ Pool rules:
 
 ## Member Schema
 
-Members are specified by IPv4 address.
+Members are specified by IPv4 address. This remains IP-only in v1 because Octavia pool membership is directly IP-based, and a server-reference variant would introduce compute-resource deletion semantics that conflict with expected CCM/CAPI scale-down flows.
 
 Each `LoadBalancerMemberV2` contains:
 
@@ -284,6 +281,17 @@ Preferred response behavior:
 
 All error responses follow the standard platform error body format (`error`, `error_description`, `trace_id`) per [SPECIFICATION.md §7.9](../../SPECIFICATION.md). The `PUT` endpoint must advertise `409` in the OpenAPI spec per [SPECIFICATION.md §7.3](../../SPECIFICATION.md).
 
+## Quota Semantics
+
+Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcement for load balancer count.
+
+- Create reserves `1` load balancer quota unit keyed by the load balancer resource UUID before returning `202 Accepted`. If quota is exhausted, the handler returns `403 forbidden`.
+- Successful provisioning promotes that reservation to a committed allocation.
+- Update does not change quota consumption. This spec does not quota-track `publicIP`, so toggling it does not consume or release load balancer quota.
+- Delete releases the committed allocation, or any still-active reservation, before the controller removes its finalizer.
+
+Shared floating-IP/public-IP quota is a cross-resource concern spanning instances and load balancers. It must be specified once at the platform level for all consumers and is intentionally not defined in this resource-specific v1 document.
+
 ## Resource Graph
 
 ### Edge Declarations
@@ -300,12 +308,14 @@ This is an intra-service edge (both resources are owned by the Region service). 
 
 - `networkId` establishes a dependency edge from the load balancer to the Region `Network`.
 - If the referenced network enters `DELETING`, the controller must initiate deletion of the dependent load balancer. The network is not blocked by the load balancer.
-- The controller registers a Kubernetes watch on the Network resource type (intra-service edge per [SPECIFICATION.md §8.6](../../SPECIFICATION.md)) to detect the network's deletion timestamp and trigger load balancer deletion.
+- The controller registers a Kubernetes watch on the Network resource type (intra-service edge per [SPECIFICATION.md §8.6](../../SPECIFICATION.md)) as the fast-path trigger for network deletion and status changes.
+- Every load balancer reconcile must also `Get` the referenced Network directly. If the Network is missing or already has a deletion timestamp, the controller must initiate load balancer deletion even if the watch event was missed while the controller was down.
 - When the Network's status changes, the controller re-derives the load balancer's status from the aggregate state of connected targets (status propagation upward per [SPECIFICATION.md §5.8](../../SPECIFICATION.md)). If the Network becomes unavailable, the load balancer reflects this in its own conditions.
 
 ### Member Address Semantics
 
 - Members are specified by IPv4 address. There is no edge relationship or cross-service dependency on compute instances.
+- This aligns the public API with Octavia's native member model and avoids introducing a server-reference abstraction that would incorrectly block instance deletion during CCM-managed or Cluster API scale-down.
 - The load balancer does not validate member address reachability at submission time.
 - With `healthCheck` enabled, provider health monitoring will detect and remove unreachable backends from rotation.
 - Without `healthCheck`, traffic may be attempted to unreachable backends until the client updates the member list.
@@ -318,8 +328,8 @@ This is an intra-service edge (both resources are owned by the Region service). 
 
 The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
 
-- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler creates the `LoadBalancer` CRD as the terminal write. If quota is enforced in a future version, the handler must use a saga with a soft reservation step and compensating transaction per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md).
-- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`.
+- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with a soft reservation step for `1` load balancer quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If quota is exhausted, it returns `403 forbidden`.
+- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. Updates do not change quota consumption because only load balancer count is quota-tracked here.
 - **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
 
 All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.md §9.2](../../SPECIFICATION.md).
@@ -328,7 +338,7 @@ All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.m
 
 ### Finalizer
 
-The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work. On deletion, the controller detects the deletion timestamp, retries silently while owned children or references exist, runs full deprovisioning (including all provider resources), and removes the finalizer only after deprovisioning completes per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
+The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work. On deletion, the controller detects the deletion timestamp, retries silently while owned children or references exist, runs full deprovisioning (including all provider resources), releases any committed quota allocation or surviving reservation, and removes the finalizer only after deprovisioning completes per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
 
 ### Deadlock Detection
 
@@ -358,11 +368,9 @@ The initial public behavior is:
 - Zero members keep the load balancer present but not yet available.
 - The implementation is IPv4-only.
 
-Provider-specific protocol, health-monitor, timeout, and persistence mapping is defined in [OpenStack Load Balancers](../providers/openstack/load-balancers.md).
+Provider-specific protocol, health-monitor, timeout, and live-discovery mapping is defined in [OpenStack Load Balancers](../providers/openstack/load-balancers.md).
 
 ## Open Questions
 
-- Should quota enforcement be included in v1, or is deferral acceptable for initial launch? If deferred, what is the target milestone?
 - Should there be maximum limits on the number of listeners, members per pool, or `allowedCidrs` entries per listener? Octavia may impose its own limits that should be surfaced.
 - When a load balancer has zero members and Octavia reports `ACTIVE` with a VIP, the condition is `ConditionReasonProvisioning`. Should the platform condition vocabulary be extended to distinguish "provisioned but not operational" from "provisioning in progress"?
-- When `region.features.loadBalancers` is `false` for a region, should the endpoints return `404` (region has no LB capability) or `422` (feature not enabled)?

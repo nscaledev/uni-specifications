@@ -499,7 +499,9 @@ Quota allocation uses a two-phase reservation model. The handler makes a soft re
 
 - List operations filter by organisation and project via label selectors derived from the principal's ACL.
 - Post-list RBAC filtering (`rbac.AllowProjectScope`) is applied in-process where label selectors alone cannot encode the access policy.
-- Tag-based filtering (`spec.tags`) is applied after the list, not as a label selector.
+- Tags are part of the standard resource metadata inherited by UNI resources and exposed in the public API at `metadata.tags`.
+- Tag-based filtering matches the resource tags exposed at `metadata.tags` and is applied after the list, not as a label selector.
+- The backing CRD or storage field used to persist tags is an implementation detail and does not define the public filtering contract.
 - List results are sorted stably (by name) to ensure deterministic ordering.
 
 ### 7.9 Error Handling and Propagation

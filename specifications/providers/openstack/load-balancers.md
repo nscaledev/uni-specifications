@@ -20,6 +20,10 @@ The initial OpenStack implementation is:
 - Public API remains provider-agnostic
 - Hidden load-balancing algorithm fixed to `ROUND_ROBIN`
 
+Terminated TLS remains out of scope so Kubernetes and CCM-managed workloads retain end-to-end TLS and, where used, client-certificate visibility at the workload.
+
+Regions that expose this API are assumed to provide Octavia with the Amphora driver. Unsupported regions are out of scope for this version rather than modeled as a discoverable feature flag.
+
 OVN compatibility is explicitly out of scope for this version, since OVN does not support VLANs currently.
 
 ## Resource Mapping
@@ -60,22 +64,9 @@ The following remain at provider defaults:
 - `timeout_member_connect`
 - `timeout_tcp_inspect`
 
-## Controller and Persistence Model
+## Controller and Live-Discovery Model
 
-The implementation adds:
-
-- A new user-facing Region CRD: `LoadBalancer`
-- A new OpenStack persistence CRD: `OpenstackLoadBalancer`
-
-`OpenstackLoadBalancer` must persist at minimum:
-
-| Scope | Required fields |
-|---|---|
-| Load balancer | `loadBalancerID`, `vipPortID`, `floatingIPID?` |
-| Listener | `name`, `listenerID`, `poolID`, `healthMonitorID?`, last applied `allowedCidrs`, last applied `idleTimeoutSeconds?`, last applied `proxyProtocolV2` |
-| Member | `listenerName`, `address`, `memberID`, `port` |
-
-Listener reconciliation is keyed by the public `listener.name`, not by provider-generated IDs alone. Member persistence must be scoped per listener or pool because the same address may appear in multiple pools with different ports.
+`LoadBalancer` is the only Region-owned resource in this design. The Octavia and Neutron objects below are implementation projections of that single Region resource, not a second public or persistent Region resource model.
 
 Extend the Region provider interfaces with:
 
@@ -83,7 +74,7 @@ Extend the Region provider interfaces with:
 - `DeleteLoadBalancer`
 - `UpdateLoadBalancerState`
 
-These are in-process Go interfaces called directly by the controller within the Region service. They do not cross an API boundary and require no authentication classification or OpenAPI annotation.
+These are in-process Go interfaces called directly by the controller within the Region service. They are not API endpoints, so OpenAPI annotation and authentication-classification language is not applicable.
 
 Provider contract:
 
@@ -91,19 +82,32 @@ Provider contract:
 - `DeleteLoadBalancer` fully tears down all provider resources, including floating IPs.
 - `UpdateLoadBalancerState` refreshes derived status such as VIP and public IP.
 
+No provider-specific persistence CRD or stored "last applied" snapshot is used. Reconcile rediscovers provider resources from live Octavia and Neutron state on every pass.
+
+Live discovery uses deterministic names and identities:
+
+- load balancer name: `lb-{loadBalancerUUID}`
+- listener name: `lb-{loadBalancerUUID}-{listenerName}`
+- pool name: `lb-{loadBalancerUUID}-{listenerName}-pool`
+- health monitor name: `lb-{loadBalancerUUID}-{listenerName}-hm`
+- member identity: `(poolID, address, port)`
+- floating IP lookup: by VIP port ID
+
 ## Reconciliation Semantics
 
 The OpenStack provider implementation must satisfy the following behavior:
 
-- Provider-side reconcile is idempotent across repeated calls. If the controller crashes mid-reconcile, the next reconcile pass reads persisted IDs from `OpenstackLoadBalancer` and resumes from the last successful state. Partial provider state is handled by the subsequent reconcile pass without manual intervention.
+- Provider-side reconcile is idempotent across repeated calls and controller restarts. Every reconcile pass discovers the live Octavia and Neutron objects for the load balancer by deterministic name or identity and resumes from the observed provider state.
+- Desired state is always diffed against live Octavia and Neutron state, never against stored "last applied" state.
 - Listener reconciliation is keyed by stable public `listener.name`.
 - A listener rename is handled as delete-and-create of the provider listener and pool subtree.
+- Changing a listener's `protocol` or `port` while keeping the same `listener.name` is reconciled as an in-place Octavia listener update, not as delete-and-create.
 - Listener CIDRs are updated in place.
 - Listener idle timeout is updated in place.
 - Health monitor create, delete, and parameter updates are reconciled in place.
 - Member sets and member ports are updated in place.
 - `proxyProtocolV2` changes for TCP listeners are reconciled without changing the public resource contract.
-- Toggling `publicIP` attaches or detaches the Neutron floating IP from the VIP port.
+- Toggling `publicIP` attaches or detaches the Neutron floating IP from the VIP port discovered for the load balancer VIP.
 
 ## Public Status Exposure
 
@@ -151,9 +155,9 @@ On deletion:
 
 1. The controller detects the deletion timestamp on the `LoadBalancer` resource.
 2. While inbound references or owned children exist, the controller retries silently (`ErrYield`).
-3. The controller calls `DeleteLoadBalancer`, which fully tears down all Octavia resources (listeners, pools, members, health monitors, the load balancer itself), detaches and deletes any Neutron floating IP, and clears the `OpenstackLoadBalancer` persistence state.
-4. The controller releases any outbound references (none in the current design, since the Network edge is a dependency, not a consumption).
-5. Only after all provider resources and references are cleaned up does the controller remove the finalizer.
+3. The controller calls `DeleteLoadBalancer`, which fully tears down all Octavia resources (listeners, pools, members, health monitors, the load balancer itself) and detaches and deletes any Neutron floating IP.
+4. The controller releases any outbound references (none in the current design, since the Network edge is a dependency, not a consumption) and releases the committed load balancer quota allocation or any still-active reservation.
+5. Only after all provider resources, quota state, and references are cleaned up does the controller remove the finalizer.
 
 ## Downstream Error Handling
 
@@ -204,13 +208,21 @@ This provider mapping does not include:
 - Additional VIPs
 - Listener connection limits
 
+Floating-IP/public-IP quota is also out of scope for this document because that quota is shared across resource types, including instances, and must be defined once at the platform level.
+
 ## Acceptance Criteria
 
 Implementation handoff must include tests that cover:
 
+- List by `tag` and verify the filter matches the public API representation of tags at `metadata.tags`.
+- Verify the load balancer public API does not expose a load-balancer-specific `spec.tags` field.
+- Verify any backing Region CRD persistence of tags is treated as internal and does not affect API semantics.
 - Create a private TCP load balancer with one or more IP-address members.
 - Create a private UDP load balancer with one or more IP-address members.
 - Create a public load balancer with `publicIP=true`.
+- Create within the load balancer quota and verify success.
+- Reject create over the load balancer quota with `403 forbidden`.
+- Delete a load balancer and verify the load balancer quota allocation is released.
 - Create a load balancer with `members: []` and verify VIP allocation succeeds while `Available` stays false until a backend becomes effective.
 - Create one load balancer with multiple listeners and different `allowedCidrs` per listener.
 - Create a TCP listener with `proxyProtocolV2=true`.
@@ -224,6 +236,8 @@ Implementation handoff must include tests that cover:
 - Update listener CIDRs in place.
 - Verify `allowedCidrs: []` and omitted `allowedCidrs` both mean unrestricted after update.
 - Update listener idle timeout in place.
+- Update a listener's `protocol` in place while keeping the same name.
+- Update a listener's `port` in place while keeping the same name.
 - Update a listener by name and verify rename is treated as delete-and-create.
 - Update member sets and member ports in place.
 - Create, remove, and update a health monitor in place.
@@ -237,11 +251,14 @@ Implementation handoff must include tests that cover:
 - Allow the same address in different pools.
 - Allow the same address with different ports in one pool.
 - Verify network deletion triggers load balancer deletion and is not blocked by the load balancer.
+- Verify network deletion while the load balancer controller is down still causes load balancer deletion after restart and reconcile.
 - Verify member address and port updates are reconciled to Octavia in place.
+- Restart the controller after a partial reconcile and verify existing Octavia resources are rediscovered without any provider persistence object.
 - Verify Amphora Octavia resources, floating IPs, and references are fully cleaned up on delete.
 - Verify `PUT` returns `409 conflict` when the resource version has advanced (conflict detection).
 - Verify `DELETE` on an already-deleting resource returns `202` without re-triggering deletion (idempotent delete).
 - Reject load balancer creation when the network is in a different organisational scope (co-location validation returns `422`).
 - Verify the controller finalizer prevents premature garbage collection during deprovisioning.
 - Verify RBAC enforcement for the `region:loadbalancers:v2` scope on all endpoints.
-- Verify behavior when `region.features.loadBalancers` is `false` for the target region.
+
+Do not add a load-balancer-only floating-IP/public-VIP quota test in this version. That quota remains a shared platform-level follow-up across instances and load balancers.
