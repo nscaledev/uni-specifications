@@ -72,6 +72,7 @@ type OpenStackReservationLocalityPreference struct {
     // Level is the hierarchy level to prefer locality within (e.g. "scale_unit").
     Level string
     // FailurePolicy controls behaviour if locality cannot be achieved.
+    // "best-effort" proceeds without locality; "hard" rejects.
     FailurePolicy string
 }
 
@@ -359,7 +360,7 @@ All calls use mTLS; the caller's service account certificate is its identity.
 
 ### Creating a Reservation
 
-The region service (or operator tooling) creates a Reservation to claim a set of racks for a project. Example for a 2-rack dev slice with soft scale-unit locality:
+The region service (or operator tooling) creates a Reservation to claim a set of racks for a project. Example for a 2-rack dev slice with best-effort scale-unit locality:
 
 ```json
 POST /reservations
@@ -369,7 +370,7 @@ POST /reservations
     "topology": { "level": "rack", "count": 2 },
     "failure_policy": "hard"
   },
-  "locality_preference": { "level": "scale_unit", "failure_policy": "soft" }
+  "locality_preference": { "level": "scale_unit", "failure_policy": "best-effort" }
 }
 ```
 
