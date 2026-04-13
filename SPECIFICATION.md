@@ -165,7 +165,7 @@ A **principal** is the originating end-user responsible for a resource. The prin
 
 A **proxy** is a service provisioning resources on behalf of a principal. The proxy carries its own service identity for transport authentication, but the principal it is acting for is propagated separately in the request context.
 
-At the public API boundary, the principal is derived from token introspection (the actor claim) combined with the organisation and project from the HTTP path. This derivation happens once, at the boundary, and the result is threaded through all downstream processing.
+At the public API boundary, the principal is derived from token introspection (the actor claim) combined with the organisation and project from the request (path segments, query parameters, or the resource spec, depending on the API surface). This derivation happens once, at the boundary, and the result is threaded through all downstream processing.
 
 A proxy may provision resources in its own tenancy or in the principal's tenancy, depending on whether direct end-user access to those resources is appropriate.
 
@@ -648,7 +648,7 @@ Every audit log entry must carry the following structured fields:
 | `component` | Service name and version |
 | `actor` | Principal subject |
 | `operation` | HTTP verb |
-| `scope` | `organisationID` and `projectID` from path |
+| `scope` | `organisationID` and `projectID` from the request |
 | `resource` | Resource type and ID |
 | `result` | HTTP status code |
 
