@@ -395,7 +395,7 @@ Each server is targeted at a specific pre-selected host. Nova does not perform h
 
 ## Integration with Gate Services
 
-A gate service subscribes to Placement lifecycle events via the Kubernetes event bus (informer on the `OpenStackPlacement` CRD). The envelope carries `ResourceID` and `DeletionTimestamp`.
+A gate service subscribes to Placement lifecycle events via the event bus. Event payloads carry `ResourceID` and `DeletionTimestamp`; gate services call `GET /placements/{id}` to retrieve current state.
 
 **On creation (DeletionTimestamp nil):**
 1. `GET /placements/{id}` — fetch full state including `Spec.NetworkID` and `Status.HostIDs`
@@ -415,10 +415,10 @@ A gate service subscribes to Placement lifecycle events via the Kubernetes event
 
 ## Event Bus
 
-The reservation service publishes Placement lifecycle events to the Kubernetes event bus using the same envelope pattern as the region service: `ResourceID` and `DeletionTimestamp`. Gate services wire up a Kubernetes informer on the `OpenStackPlacement` CRD type.
+The reservation service publishes Placement lifecycle events to the event bus (see [platform spec §5.4](../SPECIFICATION.md#54-event-bus)). Event payloads carry `resourceID` and `deletionTimestamp`; no resource state is embedded. Subscribers call `GET /placements/{id}` to retrieve current state.
 
-`DeletionTimestamp == nil` → creation or update event.
-`DeletionTimestamp` non-nil → deletion in progress; subscriber should reverse its programming.
+`deletionTimestamp == nil` → creation or update event.
+`deletionTimestamp` non-nil → deletion in progress; subscriber should reverse its programming.
 
 ---
 
