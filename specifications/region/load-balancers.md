@@ -148,7 +148,7 @@ Rules:
 - `status.vipAddress` reports the actual allocated VIP for the load balancer.
 - If create succeeds with `spec.vipAddress` set, `status.vipAddress` must equal the requested value.
 - `status.vipAddress` is stable for the lifetime of the load balancer. Once allocated, the VIP does not change.
-- `Available=True` must not be reported until `status.vipAddress` is populated.
+- `Available=True` must not be reported until all of the following hold: `status.vipAddress` is populated, at least one effective backend exists, and (when `spec.vipAddress` was set on create) `status.vipAddress` equals the requested value.
 - The public status surface is provider-agnostic. Provider IDs, per-listener operating status, per-member health, statistics, the algorithm, the status tree, and driver names are not exposed in v1.
 
 ## Listener Schema
@@ -158,8 +158,8 @@ Each listener is represented by `LoadBalancerListenerV2`:
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Stable listener identity, unique within the load balancer. |
-| `protocol` | yes | `tcp` or `udp`. |
-| `port` | yes | Frontend port number. |
+| `protocol` | yes | `tcp` or `udp`. Immutable after create. |
+| `port` | yes | Frontend port number. Immutable after create. |
 | `allowedCidrs` | no | IPv4 CIDRs allowed to reach this listener. |
 | `idleTimeoutSeconds` | no | TCP-only idle timeout override. |
 | `pool` | yes | Exactly one backend pool for this listener. |
@@ -167,8 +167,8 @@ Each listener is represented by `LoadBalancerListenerV2`:
 Listener rules:
 
 - `name` is the stable reconciliation identity for the listener.
+- `protocol` and `port` are immutable after create. On update, the handler must verify that `protocol` and `port` match the existing listener with the same `name`. A mismatch is rejected with `422 unprocessable_content`. To change a listener's protocol or port, remove the listener and add a new one.
 - Renaming a listener is treated as delete-and-create, not an in-place rename.
-- Changing a listener's `protocol` or `port` while keeping the same `name` is an in-place update. The `(protocol, port)` uniqueness constraint is validated against the full submitted listener set, not the previous state.
 - `name` must be 1 to 63 characters, use only ASCII alphanumerics and `-`, start with an alphanumeric, end with an alphanumeric, and be unique within the load balancer.
 - `(protocol, port)` must be unique within the load balancer.
 - `port` must be an integer in the range `1..65535`.
@@ -196,7 +196,7 @@ Pool rules:
 - Omitted `proxyProtocolV2` defaults to `false`.
 - `proxyProtocolV2=true` means the backend connection is wrapped in PROXY protocol version 2.
 - `members` may be `[]` on create or update.
-- A load balancer with zero members remains present and still receives a VIP, but does not report `Available=True` until at least one backend is effective.
+- A load balancer with zero members remains present and still receives a VIP. See Status rules for `Available` preconditions.
 - There is no public `algorithm` field.
 - The implementation fixes the hidden algorithm to `ROUND_ROBIN`.
 
@@ -238,7 +238,7 @@ Health-check rules:
 - There is no `protocol` field.
 - There is no `port` field.
 - There are no HTTP, HTTPS, TLS, or other L7-specific health-check fields.
-- `intervalSeconds` and `timeoutSeconds` must be integers greater than or equal to `1`.
+- `intervalSeconds` and `timeoutSeconds` must be integers in the range `1..300`.
 - `healthyThreshold` and `unhealthyThreshold` must be integers in the range `1..10`.
 - `timeoutSeconds` must be less than `intervalSeconds` when a health check is present.
 - Health-check add, remove, and parameter updates are supported in place.
@@ -254,10 +254,11 @@ Create and update validation must enforce all of the following:
 - `vipAddress`, when present in `LoadBalancerV2CreateSpec`, must be a valid IPv4 address.
 - `vipAddress` must not be accepted on `PUT`. Because `LoadBalancerV2Spec` excludes the field, any `PUT` body containing `vipAddress` is schema-invalid and returns `400 invalid_request`.
 - The referenced `networkId` must share the same organisational scope root as the load balancer (co-location constraint per [SPECIFICATION.md §5.10](../../SPECIFICATION.md)). Reject with `422 unprocessable_content` if not.
+- On update, each listener's `protocol` and `port` must match the existing listener with the same `name`. A mismatch is rejected with `422 unprocessable_content`.
 - Listener names satisfy the documented format and uniqueness rules.
 - Listener ports and member ports are integers in the range `1..65535`.
 - `idleTimeoutSeconds`, when present, is an integer in the range `1..86400`.
-- Health-check intervals and timeouts are integers greater than or equal to `1`.
+- Health-check intervals and timeouts are integers in the range `1..300`.
 - Health-check thresholds are integers in the range `1..10`.
 - `proxyProtocolV2=true` is rejected for `udp`.
 - `idleTimeoutSeconds` is rejected for `udp`.
@@ -284,6 +285,7 @@ Preferred response behavior:
 | Resource not found on GET, PUT, or DELETE | `404 not_found` |
 | Write conflict on PUT (resource version advanced) | `409 conflict` |
 | `vipAddress` present in a `PUT` body | `400 invalid_request` |
+| Listener `protocol` or `port` changed on update (mismatch with existing listener of the same `name`) | `422 unprocessable_content` |
 | Unsupported field combinations such as `proxyProtocolV2=true` on `udp` or `idleTimeoutSeconds` on `udp` | `422 unprocessable_content` |
 | Co-location constraint violation (`networkId` not in same organisational scope) | `422 unprocessable_content` |
 | `timeoutSeconds >= intervalSeconds` | `422 unprocessable_content` |
@@ -298,7 +300,7 @@ Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcem
 
 - **Create**: the saga reserves `1` `loadbalancers` quota unit keyed by the load balancer resource UUID. If `spec.publicIP=true`, the saga also reserves `1` `publicips` unit keyed by the same UUID. If either quota is exhausted, the handler returns `403 forbidden`.
 - Successful provisioning promotes both reservations to committed allocations.
-- **Update**: if `publicIP` changes from `false` to `true`, the handler updates the allocation to add `1` `publicips` unit (quota check applies; `403 forbidden` if exhausted). If `publicIP` changes from `true` to `false`, the handler updates the allocation to remove the `publicips` unit. Changes to `publicIP` do not affect the `loadbalancers` quota.
+- **Update**: if `publicIP` changes from `false` to `true`, the handler reserves `1` `publicips` unit before patching the CRD. If quota is exhausted, the handler returns `403 forbidden` without modifying the resource. The reservation is promoted to a committed allocation by the controller on successful provisioning. If the CRD patch fails (e.g., optimistic lock conflict), the handler releases the reservation as saga compensation. If `publicIP` changes from `true` to `false`, the controller releases the `publicips` unit during deprovisioning of the floating IP. Changes to `publicIP` do not affect the `loadbalancers` quota.
 - **Delete**: releasing the committed allocation covers both `loadbalancers` and `publicips` (whichever was committed) before the controller removes its finalizer.
 
 ## Resource Graph
@@ -338,7 +340,7 @@ This is an intra-service edge (both resources are owned by the Region service). 
 The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
 
 - **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If `spec.vipAddress` is present, the handler persists it as a distinct immutable internal field (for example `requestedVipAddress`) on the backing resource so reconcile can replay the same provider request idempotently across retries and restarts. If either quota is exhausted, it returns `403 forbidden`.
-- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. `vipAddress` is intentionally absent from `LoadBalancerV2Spec`; any `PUT` body containing it fails schema validation with `400 invalid_request`. If `publicIP` toggles from `false` to `true`, the handler checks `publicips` quota and returns `403 forbidden` if exhausted, then updates the allocation to add the `publicips` unit. If `publicIP` toggles from `true` to `false`, the handler updates the allocation to remove the `publicips` unit.
+- **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. `vipAddress` is intentionally absent from `LoadBalancerV2Spec`; any `PUT` body containing it fails schema validation with `400 invalid_request`. If `publicIP` toggles from `false` to `true`, the handler reserves `1` `publicips` unit before patching the CRD and returns `403 forbidden` if exhausted; the reservation is released as compensation if the CRD patch fails. If `publicIP` toggles from `true` to `false`, the `publicips` unit is released by the controller during floating IP deprovisioning.
 - **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
 
 All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.md §9.2](../../SPECIFICATION.md).

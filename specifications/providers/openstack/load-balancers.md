@@ -109,7 +109,7 @@ The OpenStack provider implementation must satisfy the following behavior:
 - If `requestedVipAddress` is present, reconcile must either allocate that exact VIP or surface a genuine error. It must never accept or allocate a different private VIP as fallback.
 - Listener reconciliation is keyed by stable public `listener.name`.
 - A listener rename is handled as delete-and-create of the provider listener and pool subtree.
-- Changing a listener's `protocol` or `port` while keeping the same `listener.name` is reconciled as an in-place Octavia listener update, not as delete-and-create.
+- Listener `protocol` and `port` are immutable after create (enforced at the public API layer). The provider does not need to handle in-place mutation of either field. Octavia does not support updating `protocol` or `protocol_port` on an existing listener.
 - Listener CIDRs are updated in place.
 - Listener idle timeout is updated in place.
 - Health monitor create, delete, and parameter updates are reconciled in place.
@@ -155,6 +155,7 @@ Every reconcile pass, successful or not, must update the `Available` condition b
 | `ACTIVE` with stored `requestedVipAddress` but a different live VIP | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | `ERROR` | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | Zero members or zero effective backends | `Available=False` with reason `ConditionReasonProvisioning` | `ErrYield` | Fixed interval requeue |
+| Network dependency unavailable or deleted | `Available=False` with reason `ConditionReasonErrored`; controller initiates load balancer deletion if Network has deletion timestamp | Per Network Dependency rules in region spec | Per Network Dependency rules in region spec |
 
 The zero-members case uses `ConditionReasonProvisioning` because the load balancer is not yet fully operational, even though the Octavia LB itself may be `ACTIVE` with a VIP allocated. This is the best-fit standard reason within the platform's condition vocabulary. Callers should not interpret `ConditionReasonProvisioning` as necessarily meaning infrastructure provisioning is in progress.
 
@@ -187,7 +188,7 @@ When the controller receives error responses from Octavia or Neutron API calls, 
 | 403 | Genuine error. Surface as `ConditionReasonErrored`. Permission failure will not resolve without intervention. |
 | 401 | Transient for a bounded number of retries (credential refresh). If persistent, surface as `ConditionReasonErrored`. |
 
-The controller must not poll Octavia to check whether dependent resources are ready. Dependency readiness is inferred from local status conditions via status propagation upward per [SPECIFICATION.md §8.7](../../../SPECIFICATION.md).
+The controller must not poll Octavia to check whether dependent resources are ready. Reconcile rediscovers provider resources from live state on every pass (see Reconciliation Semantics above) and infers dependency readiness from local status conditions via status propagation upward per [SPECIFICATION.md §5.8](../../../SPECIFICATION.md).
 
 ## Deadlock Detection
 
@@ -250,13 +251,14 @@ Implementation handoff must include tests that cover:
 - Create a load balancer with `healthCheck: {}`.
 - Create a TCP listener with explicit health-check values.
 - Create a UDP listener with explicit health-check values.
+- Reject a health check where `timeoutSeconds >= intervalSeconds` with `422 unprocessable_content`.
 - Create a TCP listener with `idleTimeoutSeconds`.
 - Reject `idleTimeoutSeconds` on UDP listeners.
 - Update listener CIDRs in place.
 - Verify `allowedCidrs: []` and omitted `allowedCidrs` both mean unrestricted after update.
 - Update listener idle timeout in place.
-- Update a listener's `protocol` in place while keeping the same name.
-- Update a listener's `port` in place while keeping the same name.
+- Reject updating a listener's `protocol` while keeping the same name with `422 unprocessable_content`.
+- Reject updating a listener's `port` while keeping the same name with `422 unprocessable_content`.
 - Update a listener by name and verify rename is treated as delete-and-create.
 - Update member sets and member ports in place.
 - Create, remove, and update a health monitor in place.
