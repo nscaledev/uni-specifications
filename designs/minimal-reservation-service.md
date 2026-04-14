@@ -225,9 +225,7 @@ On deletion (DeletionTimestamp non-nil):
 
 2. Remove CUSTOM_UNIKORN_CLAIMED trait from each host in Status.HostIDs
        For each host UUID:
-           GET /placement/resource_providers/{uuid}/traits
-           PUT /placement/resource_providers/{uuid}/traits
-               with CUSTOM_UNIKORN_CLAIMED removed, passing current generation
+           DELETE /v1/nodes/{uuid}/traits/CUSTOM_UNIKORN_CLAIMED
 
 3. Remove controller finalizer — Placement is deleted
 ```
@@ -261,17 +259,17 @@ Placement has a ~60-second sync lag from Ironic. To guard against stale data, ea
 Group the remaining candidates by rack. For each constraint in `Spec.SpreadConstraints`, distribute `MachineCount` hosts to satisfy `MaxSkew`. If `FailurePolicy: hard` and the constraint cannot be satisfied with available hosts, reject and return an error. Record actual skew per constraint in `SpreadResults`.
 
 **Step 5 — Claim the selected hosts.**
-For each selected host, set the `CUSTOM_UNIKORN_CLAIMED` trait using the Placement API's optimistic locking:
+For each selected host, set the `CUSTOM_UNIKORN_CLAIMED` trait via the Ironic API:
 
 ```
-GET /placement/resource_providers/{uuid}/traits   → current traits + generation
-PUT /placement/resource_providers/{uuid}/traits   → traits ∪ {CUSTOM_UNIKORN_CLAIMED}, generation N
-    409 Conflict → re-read generation and retry
-    If host now has CUSTOM_UNIKORN_CLAIMED set by a concurrent Placement:
-        rollback already-claimed hosts in this batch, restart from Step 2
+PUT /v1/nodes/{uuid}/traits/CUSTOM_UNIKORN_CLAIMED
 ```
 
-If no sufficient set of hosts is available, the controller sets a `HostUnavailable` condition and requeues. The Placement API's generation-based optimistic locking means that a concurrent claim on the same host produces a detectable 409 rather than a silent double-allocation. The worst-case outcome of a race is a retry, not an incorrect allocation.
+This call is idempotent. The Nova virt driver periodically syncs Ironic node traits to the Placement API resource provider; writing the trait directly to the Placement API would be overwritten on the next sync, so Ironic is the correct target.
+
+The Ironic traits API has no generation-based optimistic locking. Concurrent claim races are prevented instead by running Placement reconciliation with `MaxConcurrentReconciles: 1` and Kubernetes leader election, ensuring only one claim sequence executes at a time.
+
+If no sufficient set of hosts is available, the controller sets a `HostUnavailable` condition and requeues.
 
 ### Resource References
 
@@ -440,7 +438,7 @@ The reservation service publishes Placement lifecycle events to the event bus (s
 | 2026-04-01 | Deletion blocking via reference REST API, not direct finalizer writes | Per platform spec section 5.3, external services never write another service's finalizers directly. The reservation service exposes canonical `PUT`/`DELETE` reference endpoints and manages finalizers internally. |
 | 2026-04-01 | CRD named `OpenStackPlacement` | The CRD is OpenStack-specific (Ironic node UUIDs, Placement API traits). Making the provider explicit in the type name is consistent with the design's stated principle of no provider abstraction, and avoids naming conflicts if other provider types are added later. |
 | 2026-04-01 | Host selection via Placement API, cross-checked against Ironic | `GET /placement/resource_providers?resources=<class>:1` gives a more accurate availability view than querying Ironic directly — it reflects Nova allocations for nodes mid-deploy. Resource class is resolved from the flavour's `resources:CUSTOM_*` extra spec. Ironic is still checked to guard against Placement's ~60s sync lag. |
-| 2026-04-08 | Disjointness enforced via `CUSTOM_UNIKORN_CLAIMED` trait | Setting a custom trait on claimed hosts allows a single `required=!CUSTOM_UNIKORN_CLAIMED` filter in the host selection query, regardless of how many active Placements exist. The Placement API's per-resource-provider generation locking makes concurrent claims detectable and safely retriable. |
+| 2026-04-08 | Disjointness enforced via `CUSTOM_UNIKORN_CLAIMED` trait | Setting a custom trait on claimed hosts allows a single `required=!CUSTOM_UNIKORN_CLAIMED` filter in the host selection query, regardless of how many active Placements exist. The trait is set and removed via the Ironic API (not the Placement API directly) because Ironic is the source of truth for node traits; the Nova virt driver syncs Ironic → Placement and would overwrite any direct Placement API writes. Concurrent claim races are prevented by controller serialisation (`MaxConcurrentReconciles: 1` with leader election) rather than optimistic locking. |
 | 2026-04-08 | Topology constraints are a Placement concern, not a Reservation concern | Topology is a placement policy — where to put hosts — not a capacity policy. Rack affinity and spread are placement use cases. The Reservation layer expresses count and locality; the Placement expresses spread and host selection. |
 | 2026-04-09 | Reservation is a rack-level capacity boundary; Placement carves hosts from it | Separates the operator concern (which racks are dedicated to this project) from the workload concern (how to distribute N hosts across those racks). Gate services' contract is unchanged — they still see only a Placement with a fixed host list, a VPC, and readiness gates. |
 | 2026-04-09 | Servers target a specific host via `force_hosts` hint | Nova has no "boot into aggregate X" primitive. Since `Status.HostIDs` is resolved at Placement creation time, each server can be directed to a specific host directly. This avoids aggregate scheduler hints and makes host assignment explicit and auditable. |
