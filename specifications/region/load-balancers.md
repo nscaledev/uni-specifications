@@ -8,6 +8,7 @@ The standard Region v2 resource envelope and the platform-wide rules in [SPECIFI
 
 | Version | Date | Notes |
 |---|---|---|
+| v0.2 | 2026-04-15 | Align network deletion semantics with owner-based foreground cascade while keeping network status propagation. |
 | v0.1 | 2026-04-13 | Initial version |
 
 ## Initial Scope
@@ -307,21 +308,26 @@ Per [SPECIFICATION.md §7.6](../../SPECIFICATION.md), v1 requires quota enforcem
 
 ### Edge Declarations
 
-Per [SPECIFICATION.md §5.10](../../SPECIFICATION.md), the LoadBalancer resource type declares the following edge:
+Per [SPECIFICATION.md §5.8](../../SPECIFICATION.md) and [§5.10](../../SPECIFICATION.md), the LoadBalancer resource type declares separate lifecycle and status relationships for the same resource pair because deletion ownership and status observation point in opposite directions:
 
-| Edge | Type | Properties |
-|---|---|---|
-| LoadBalancer → Network | Dependency | Reverse Deletion Propagation (triggering) + Status Propagation Upward + Co-location Required |
+| Relationship | Properties |
+|---|---|
+| Network → LoadBalancer | Forward Deletion Propagation via Kubernetes owner reference with blocking owner deletion / foreground cascading semantics |
+| LoadBalancer → Network | Status Propagation Upward + Co-location Required |
 
-This is an intra-service edge (both resources are owned by the Region service). No blocking reference is placed on the Network per the Dependency edge contract ([SPECIFICATION.md §5.7](../../SPECIFICATION.md)).
+Both relationships are intra-service (the Region service owns both resource types). No long-lived reference API hold is placed on the Network during steady-state load-balancer lifetime.
 
-### Network Dependency
+### Network Ownership and Status Observation
 
-- `networkId` establishes a dependency edge from the load balancer to the Region `Network`.
-- If the referenced network enters `DELETING`, the controller must initiate deletion of the dependent load balancer. The network is not blocked by the load balancer.
-- The controller registers a Kubernetes watch on the Network resource type (intra-service edge per [SPECIFICATION.md §8.6](../../SPECIFICATION.md)) as the fast-path trigger for network deletion and status changes.
-- Every load balancer reconcile must also `Get` the referenced Network directly. If the Network is missing or already has a deletion timestamp, the controller must initiate load balancer deletion even if the watch event was missed while the controller was down.
-- When the Network's status changes, the controller re-derives the load balancer's status from the aggregate state of connected targets (status propagation upward per [SPECIFICATION.md §5.8](../../SPECIFICATION.md)). If the Network becomes unavailable, the load balancer reflects this in its own conditions.
+- `networkId` is immutable after create.
+- On create, the handler validates the referenced `Network` and creates the backing `LoadBalancer` resource with that `Network` as its Kubernetes owner. Because `networkId` cannot change later, this owner relationship is fixed for the lifetime of the load balancer.
+- The owner reference uses blocking owner deletion / foreground cascading semantics. When the `Network` is deleted, Kubernetes tombstones the owned `LoadBalancer` as part of the same intra-service delete flow.
+- Standalone `DELETE` of a load balancer is unchanged.
+- During a network delete, the load balancer controller does not independently synthesize deletion from the `Network` deletion timestamp. It reconciles the already-deleting `LoadBalancer`, performs normal provider deprovisioning, releases quota state, and removes its finalizer.
+- The controller registers a Kubernetes watch on the `Network` resource type and directly `Get`s the referenced `Network` during reconcile for status propagation only. These reads are not used to synthesize load-balancer deletion from a network tombstone.
+- When the `Network` status changes, the controller re-derives the load balancer's status from the aggregate state of connected targets (status propagation upward per [SPECIFICATION.md §5.8](../../SPECIFICATION.md)).
+- If the `LoadBalancer` already has a deletion timestamp, a missing or deleting `Network` is expected during owner-driven cascade and must not be treated as a separate dependency-triggered delete path.
+- If the `LoadBalancer` is not deleting and the observed `Network` is unavailable, the load balancer reflects this in `Available=False`.
 
 ### Member Address Semantics
 
@@ -339,7 +345,7 @@ This is an intra-service edge (both resources are owned by the Region service). 
 
 The standard Region v2 handler layer responsibilities ([SPECIFICATION.md §7.2](../../SPECIFICATION.md)) apply. Load-balancer-specific notes:
 
-- **Create**: the handler derives labels and annotations via `conversion.NewObjectMetadata`. Labels and annotations are never accepted from the request body. The handler uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write. If `spec.vipAddress` is present, the handler persists it as a distinct immutable internal field (for example `requestedVipAddress`) on the backing resource so reconcile can replay the same provider request idempotently across retries and restarts. If either quota is exhausted, it returns `403 forbidden`.
+- **Create**: the handler validates the referenced `Network`, derives labels and annotations via `conversion.NewObjectMetadata`, and never accepts labels or annotations from the request body. It uses a saga with soft reservation steps for `1` `loadbalancers` quota unit and, when `spec.publicIP=true`, `1` `publicips` quota unit per [SPECIFICATION.md §7.5, §7.6](../../SPECIFICATION.md), then creates the `LoadBalancer` CRD as the terminal write with the referenced `Network` set as Kubernetes owner using blocking owner deletion / foreground cascading semantics. If `spec.vipAddress` is present, the handler persists it as a distinct immutable internal field (for example `requestedVipAddress`) on the backing resource so reconcile can replay the same provider request idempotently across retries and restarts. If either quota is exhausted, it returns `403 forbidden`.
 - **Update**: the handler reads the current resource, re-derives labels and annotations, and patches with optimistic locking via `MergeFromWithOptimisticLock`. A concurrent modification returns `409 conflict`. `vipAddress` is intentionally absent from `LoadBalancerV2Spec`; any `PUT` body containing it fails schema validation with `400 invalid_request`. If `publicIP` toggles from `false` to `true`, the handler reserves `1` `publicips` unit before patching the CRD and returns `403 forbidden` if exhausted; the reservation is released as compensation if the CRD patch fails. If `publicIP` toggles from `true` to `false`, the `publicips` unit is released by the controller during floating IP deprovisioning.
 - **Delete**: the handler verifies `DeletionTimestamp` is nil before issuing the delete. If already set, it returns `202` idempotently.
 
@@ -349,7 +355,7 @@ All POST, PUT, and DELETE operations emit audit log entries per [SPECIFICATION.m
 
 ### Finalizer
 
-The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work. On deletion, the controller detects the deletion timestamp, retries silently while owned children or references exist, runs full deprovisioning (including all provider resources), releases any committed quota allocation or surviving reservation, and removes the finalizer only after deprovisioning completes per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
+The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work. On deletion, whether initiated directly or via owner-driven `Network` cascade, the controller detects the load balancer deletion timestamp, retries silently while owned children or references exist, runs full deprovisioning (including all provider resources), releases any committed quota allocation or surviving reservation, and removes the finalizer only after deprovisioning completes per [SPECIFICATION.md §8.5](../../SPECIFICATION.md).
 
 ### Deadlock Detection
 

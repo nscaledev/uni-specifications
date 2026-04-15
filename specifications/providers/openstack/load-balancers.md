@@ -8,6 +8,7 @@ The initial provider assumption is Octavia with the Amphora driver. This is an i
 
 | Version | Date | Notes |
 |---|---|---|
+| v0.2 | 2026-04-15 | Align delete flow with owner-driven network cascade and keep network health as status-only input. |
 | v0.1 | 2026-04-13 | Initial version |
 
 ## Scope and Assumptions
@@ -118,6 +119,8 @@ The OpenStack provider implementation must satisfy the following behavior:
 - Updates to listeners or `publicIP` preserve the existing VIP. Reconcile does not attempt VIP mutation on update.
 - If live provider state is rediscovered with a VIP different from stored `requestedVipAddress`, the provider treats this as permanent drift and surfaces `ConditionReasonErrored` rather than silently accepting or recreating.
 - Toggling `publicIP` attaches or detaches the Neutron floating IP from the VIP port discovered for the load balancer VIP.
+- Network deletion reaches this provider delete path only after Kubernetes has already tombstoned the Region `LoadBalancer` via owner-driven cascade from the owning `Network`. The provider implementation does not initiate deletion from a `Network` deletion timestamp.
+- If the `LoadBalancer` already has a deletion timestamp, a missing or deleting `Network` is expected during cascaded deletion and must not be treated as a separate dependency-triggered error path.
 
 ## Public Status Exposure
 
@@ -155,9 +158,11 @@ Every reconcile pass, successful or not, must update the `Available` condition b
 | `ACTIVE` with stored `requestedVipAddress` but a different live VIP | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | `ERROR` | `Available=False` with reason `ConditionReasonErrored` | error | Exponential backoff |
 | Zero members or zero effective backends | `Available=False` with reason `ConditionReasonProvisioning` | `ErrYield` | Fixed interval requeue |
-| Network dependency unavailable or deleted | `Available=False` with reason `ConditionReasonErrored`; controller initiates load balancer deletion if Network has deletion timestamp | Per Network Dependency rules in region spec | Per Network Dependency rules in region spec |
+| Network unavailable while the `LoadBalancer` is not deleting | `Available=False` with reason `ConditionReasonErrored` | `nil` | Removed from queue |
 
 The zero-members case uses `ConditionReasonProvisioning` because the load balancer is not yet fully operational, even though the Octavia LB itself may be `ACTIVE` with a VIP allocated. This is the best-fit standard reason within the platform's condition vocabulary. Callers should not interpret `ConditionReasonProvisioning` as necessarily meaning infrastructure provisioning is in progress.
+Octavia `ACTIVE` alone is insufficient for `Available=True` when the observed `Network` is unhealthy.
+When the `LoadBalancer` already has a deletion timestamp, a missing or deleting `Network` is expected during owner-driven cascade and is handled by the `PENDING_DELETE or local delete flow` row above, not as a separate dependency-triggered deletion rule.
 
 When a requested VIP is configured, `status.vipAddress` remains empty until Octavia reports that exact address as the live VIP. A provider rejection of the requested VIP is surfaced as `ConditionReasonErrored`; the implementation must not fall back to a different private VIP.
 
@@ -167,13 +172,15 @@ If the status write itself fails (e.g., resource version conflict), the controll
 
 The controller adds its finalizer to the `LoadBalancer` resource before performing any provisioning work per [SPECIFICATION.md §8.5](../../../SPECIFICATION.md).
 
+In a cascaded network delete, Kubernetes sets the `LoadBalancer` deletion timestamp via owner-driven foreground cascade before provider teardown begins.
+
 On deletion:
 
 1. The controller detects the deletion timestamp on the `LoadBalancer` resource.
 2. While inbound references or owned children exist, the controller retries silently (`ErrYield`).
 3. The controller calls `DeleteLoadBalancer`, which fully tears down all Octavia resources (listeners, pools, members, health monitors, the load balancer itself) and detaches and deletes any Neutron floating IP.
-4. The controller releases any outbound references (none in the current design, since the Network edge is a dependency, not a consumption) and releases the committed quota allocations (`loadbalancers` and, if `publicIP=true`, `publicips`) or any still-active reservations.
-5. Only after all provider resources, quota state, and references are cleaned up does the controller remove the finalizer.
+4. The controller releases the committed quota allocations (`loadbalancers` and, if `publicIP=true`, `publicips`) or any still-active reservations. There is no long-lived outbound reference hold on the `Network` in steady state.
+5. Only after all provider resources, quota state, and any other references owned by the `LoadBalancer` are cleaned up does the controller remove the finalizer.
 
 ## Downstream Error Handling
 
@@ -188,7 +195,7 @@ When the controller receives error responses from Octavia or Neutron API calls, 
 | 403 | Genuine error. Surface as `ConditionReasonErrored`. Permission failure will not resolve without intervention. |
 | 401 | Transient for a bounded number of retries (credential refresh). If persistent, surface as `ConditionReasonErrored`. |
 
-The controller must not poll Octavia to check whether dependent resources are ready. Reconcile rediscovers provider resources from live state on every pass (see Reconciliation Semantics above) and infers dependency readiness from local status conditions via status propagation upward per [SPECIFICATION.md §5.8](../../../SPECIFICATION.md).
+The controller must not poll Octavia to check whether prerequisite resources are ready. Reconcile rediscovers provider resources from live state on every pass (see Reconciliation Semantics above) and infers network health from local status conditions via status propagation upward per [SPECIFICATION.md §5.8](../../../SPECIFICATION.md).
 
 ## Deadlock Detection
 
@@ -274,13 +281,20 @@ Implementation handoff must include tests that cover:
 - Allow the same address in different pools.
 - Allow the same address with different ports in one pool.
 - Submit a create with a syntactically valid but unusable requested VIP and verify `Available=False` with `ConditionReasonErrored` and no fallback VIP allocation.
-- Verify network deletion triggers load balancer deletion and is not blocked by the load balancer.
-- Verify network deletion while the load balancer controller is down still causes load balancer deletion after restart and reconcile.
+- Verify network deletion foreground-cascades to the load balancer via the owner relationship.
+- Verify the network remains in deletion until the load balancer finalizer completes provider cleanup.
+- Verify a network-deleted, already-tombstoned load balancer resumes deprovisioning after controller restart without relying on a missed network deletion watch event.
+- Verify network unavailability without deletion drives `Available=False`.
+- Verify Octavia `ACTIVE` alone is insufficient for `Available=True` when the network is unhealthy.
 - Verify member address and port updates are reconciled to Octavia in place.
 - Restart the controller after a partial reconcile and verify existing Octavia resources are rediscovered without any provider persistence object, and that a stored requested VIP is replayed idempotently.
 - Verify live-provider rediscovery does not silently accept drift where the live VIP differs from the stored requested value.
-- Verify Amphora Octavia resources, floating IPs, and references are fully cleaned up on delete.
-- Verify delete cleanup is unchanged for load balancers with and without a requested VIP.
+- Verify Amphora Octavia resources and floating IPs are fully cleaned up during direct load balancer delete.
+- Verify Amphora Octavia resources and floating IPs are fully cleaned up during cascaded load balancer delete.
+- Verify quota release is unchanged for direct delete and cascaded delete.
+- Verify no long-lived Network reference API hold exists during steady-state load balancer lifetime.
+- Verify deletion behavior is identical for load balancers with and without `publicIP`.
+- Verify deletion behavior is identical for load balancers with and without a requested `vipAddress`.
 - Verify `PUT` returns `409 conflict` when the resource version has advanced (conflict detection).
 - Verify `PUT` containing `vipAddress` is rejected with `400 invalid_request`.
 - Verify `DELETE` on an already-deleting resource returns `202` without re-triggering deletion (idempotent delete).

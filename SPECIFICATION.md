@@ -321,6 +321,7 @@ Status propagation is orthogonal to deletion semantics. Where an edge carries st
 - For intra-service edges, Kubernetes watches on the target resource type satisfy this directly.
 - For cross-service edges, the event bus provides the stimulus.
 - Status propagation upward may be carried by any edge type. Whether a given edge carries it is a declaration made when the resource type is defined. It is not assumed.
+- If lifecycle ownership and status observation point in opposite directions between the same resource pair, the resource-type spec may document them as separate directed relationships with different property sets. This is a clarification of how to describe the graph; it does not change the deletion model.
 
 ### 5.9 Deletion Propagation Mechanisms
 
