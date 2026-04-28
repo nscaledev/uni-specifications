@@ -680,6 +680,8 @@ Metric naming must follow Prometheus conventions: `snake_case`, service-prefixed
 
 Metric labels must be used only for dimensions with bounded, low cardinality. Do not label metrics with unbounded or per-instance values such as resource IDs, user IDs, request IDs, or free-form user input unless the dimension is explicitly required and its cardinality is known to be small.
 
+State metrics are the exception. A state metrics exporter may expose a gauge labelled with the resource ID when the series represents a transient or anomalous resource state. These metrics must not be used as general per-resource inventory metrics.
+
 Where a metric is intentionally split by a named platform value, such as a server region, emit both the stable identifier and the display name as labels. The identifier is authoritative and is used for alerting; the name is for human-readable dashboards and chart legends.
 
 Use `_id` and `_name` suffixes to distinguish these labels, for example `region_id` and `region_name`.
