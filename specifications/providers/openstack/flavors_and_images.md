@@ -157,8 +157,8 @@ All formats are specified in Typescript.
 |Field|Required|Format|Description|
 |---|---|---|---|
 |unikorn:os:kernel|:white_check_mark:|"linux"|Specifies the kernel used by the operating system.|
-|unikorn:os:family|:white_check_mark:|"debian" \| "redhat"|Defines the operating system family, which typically determines the package format.|
-|unikorn:os:distro|:white_check_mark:|"ubuntu" \| "rocky"|Indicates the specific operating system distribution.|
+|unikorn:os:family|:white_check_mark:| string |Defines the operating system family, which typically determines the package format (e.g "redhat" or "debian").|
+|unikorn:os:distro|:white_check_mark:| string |Indicates the specific operating system distribution (e.g "rocky" or "ubuntu").|
 |unikorn:os:variant|:x:|string|Defines the variant or edition of the operating system, such as "server" or "desktop".|
 |unikorn:os:codename|:x:|string|Defines the codename for the operating system release (e.g., Noble Numbat).|
 |unikorn:os:version|:white_check_mark:|string|Specifies the version of the operating system (e.g., 24.04, 20.04).|
