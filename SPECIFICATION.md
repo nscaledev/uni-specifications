@@ -14,7 +14,8 @@ Nscale Cloud Platform Engineering
 2. [Platform Model](#2-platform-model)
    - [2.1 Services and Owned Resources](#21-services-and-owned-resources)
    - [2.2 Service Dependency Order](#22-service-dependency-order)
-   - [2.3 Service Layering and Resource Accountability](#23-service-layering-and-resource-accountability)
+   - [2.3 Cloud Provider Abstraction](#23-cloud-provider-abstraction)
+   - [2.4 Service Layering and Resource Accountability](#24-service-layering-and-resource-accountability)
 3. [Data Boundaries](#3-data-boundaries)
 4. [Identity and Access](#4-identity-and-access)
    - [4.1 Organisational Hierarchy](#41-organisational-hierarchy)
@@ -25,6 +26,7 @@ Nscale Cloud Platform Engineering
      - [4.5.1 API Authentication Classifications](#451-api-authentication-classifications)
    - [4.6 Principal Propagation Modes and Impersonation](#46-principal-propagation-modes-and-impersonation)
      - [4.6.1 ACL Intersection under Impersonation](#acl-intersection-under-impersonation)
+   - [4.7 Token Infrastructure](#47-token-infrastructure)
 5. [Resource Graph](#5-resource-graph)
    - [5.1 Edge Properties](#51-edge-properties)
    - [5.2 Edge Types by Property Intersection](#52-edge-types-by-property-intersection)
@@ -54,6 +56,7 @@ Nscale Cloud Platform Engineering
    - [7.7 API Versioning](#77-api-versioning)
    - [7.8 List Filtering](#78-list-filtering)
    - [7.9 Error Handling and Propagation](#79-error-handling-and-propagation)
+   - [7.10 v2 API Design Model](#710-v2-api-design-model)
 8. [Controller Behaviour](#8-controller-behaviour)
    - [8.1 The Work Queue](#81-the-work-queue)
    - [8.2 Transient Conditions and Silent Retry](#82-transient-conditions-and-silent-retry)
@@ -63,6 +66,7 @@ Nscale Cloud Platform Engineering
    - [8.6 Controller Watches](#86-controller-watches)
    - [8.7 Downstream Error Handling](#87-downstream-error-handling)
    - [8.8 Deletion Deadlock Detection](#88-deletion-deadlock-detection)
+   - [8.9 Status Projection and Monitoring](#89-status-projection-and-monitoring)
 9. [Observability](#9-observability)
    - [9.1 Structured Logging](#91-structured-logging)
    - [9.2 Audit Logging](#92-audit-logging)
@@ -115,7 +119,17 @@ Identity Service  ←  Region Service  ←  Compute Service
                                      ←  Kubernetes Service
 ```
 
-### 2.3 Service Layering and Resource Accountability
+### 2.3 Cloud Provider Abstraction
+
+The Region service implements the platform's cloud-agnosticism through a provider interface. All cloud lifecycle operations — identity provisioning, network management, server lifecycle, image and flavor discovery — are expressed against this interface. No platform code above the Region service has any knowledge of the underlying cloud substrate.
+
+Two capability levels exist. The discovery interface covers region capability and flavor inventory and must be implemented by all providers. The full lifecycle interface extends this with the complete set of cloud operations and is required for providers that host user workloads.
+
+Three provider implementations exist: OpenStack (full lifecycle), Kubernetes (discovery only, for Kubernetes-backed regions), and a simulated backend used for testing. New cloud substrates are onboarded by implementing the provider interface; no changes to Region's handler or controller logic are required.
+
+Where a cloud API is insufficient — for example, where the provider does not allocate network segmentation IDs or where image metadata retrieval is too slow for interactive use — the Region service implements compensating mechanisms at the provider layer. These are internal to Region and invisible to callers.
+
+### 2.4 Service Layering and Resource Accountability
 
 Higher-order services build on lower-order services by following a consistent layering pattern: the higher-order service owns its own resource (enforcing the data boundary), drives the lower-order service's resource through its versioned API, and projects status back up from the lower-order resource into its own.
 
@@ -193,7 +207,7 @@ A **principal** is the actor identified by the attribution concern. The principa
 
 A **proxy** is a service provisioning resources on behalf of a principal. The proxy carries its own system account identity for transport authentication, but the principal it is acting for is propagated separately in the request context.
 
-At the public API boundary, the principal is derived from token introspection (the actor claim) combined with the organisation and project from the HTTP path. This derivation happens once, at the boundary, and the result is threaded through all downstream processing.
+At the public API boundary, the caller's identity is established by token introspection (the actor claim). Organisational context — organisation and project — must be resolved at the earliest possible point and must be present before any downstream service call or resource write. In v1 services this context is present in the URL path. In v2 services there are two cases: for a root resource the caller must supply organisation and project in the request body; for a child resource (one whose tenancy is implied by a parent) the handler infers organisation and project by reading the parent resource's labels. See [section 7.10](#710-v2-api-design-model).
 
 A proxy may provision resources in its own tenancy or in the principal's tenancy, depending on whether direct end-user access to those resources is appropriate.
 
@@ -252,6 +266,20 @@ The scope hierarchy rule follows from the above:
 - **No privilege escalation** — impersonation can only reduce the user's effective permissions, never expand them.
 - **Principle of least authority** — each service is confined to the subset of the user's permissions that the service itself is authorised for, regardless of the user's own role.
 - **Attribution-only callers unaffected** — services that set `X-Principal` without `X-Impersonate` continue to resolve RBAC against their own system account role only, with no change in behaviour.
+
+### 4.7 Token Infrastructure
+
+The Identity service is the platform's OAuth2/OIDC authorization server. It does not merely validate tokens issued elsewhere — it issues all tokens used within the platform and is the trust root for all bearer-token-based authentication.
+
+**Token classes.** The Identity service issues distinct token types for two bearer-token actor classes: federated user tokens (derived from upstream OIDC providers) and service account tokens (for org-bound non-human identities). Each class is normalized to the platform's internal format. Upstream provider tokens are never forwarded directly. System accounts authenticate exclusively via mTLS — they receive no bearer token from Identity; the certificate is the identity.
+
+**Signing key rotation.** Tokens are signed using ES512. The Identity service maintains a rolling two-key window: the current primary key and the immediately previous key. New tokens are always signed with the current primary key. Verification accepts either key, meaning tokens survive one rotation before they become invalid. This window is the platform's guarantee against service disruption during key rotation. Any service that attempts to validate tokens locally must respect this two-key window; validation against a single fixed key is a defect.
+
+**Token exchange.** The platform supports RFC 8693 token exchange for service-to-service trust chains. A caller presents a validated platform access token as a subject token; the Identity service issues a short-lived signed passport JWT recording the source identity, account type, organisation, optional project, and requested audience. This passport is the mechanism by which a service can prove delegated authority to a downstream service without forwarding the caller's full access token. Downstream services resolve RBAC normally against the Identity ACL endpoint — the passport does not embed permissions.
+
+**Session model.** Each user has at most one active session per OAuth2 client. Refresh token rotation invalidates the prior token. This is the platform's primary defence against refresh token replay; a reused refresh token signals a compromised session.
+
+**Protected protocol state.** Login dialog state, upstream OIDC state, and authorization codes are expressed as encrypted JWE tokens rather than persisted server-side state. This keeps the Identity service stateless with respect to in-flight auth flows.
 
 ---
 
@@ -558,6 +586,20 @@ Every error response body carries: `error` (machine-readable code), `error_descr
 - Untyped errors are caught by the terminal error handler and written as `500 server_error` with no detail.
 - The `401` response includes a `WWW-Authenticate` header per RFC6750 and RFC9728. Services must not construct this header manually — use the canonical `AccessDenied` constructor from the core library.
 
+### 7.10 v2 API Design Model
+
+The v2 API is the target design for all platform services. New services must follow the v2 model. The v1 model is retained only for backward compatibility in existing services and must not be used as a reference for new work.
+
+**Flat routing.** v1 APIs embedded organisation and project in the URL path, coupling the routing structure to the tenancy hierarchy. This made cross-project resource references awkward and produced deeply nested paths. v2 routes resources directly by their UUID. Organisation and project context is not required in the URL — it is inferred from the resource itself, from a field in the request body, or from a related resource resolved during the request.
+
+**Relationship-driven scoping.** In v1, list operations traversed the URL hierarchy to determine scope. In v2, list operations begin with a label selector that encodes the relevant constraints (organisation, project, region, network, etc.), then apply RBAC filtering per item. Scope is a property of the resource, expressed through its labels, not a property of the path.
+
+**Direct resource addressing.** Resources are addressed by their UUID in all operations. There is no hierarchical path traversal to reach a resource. A handler resolves scope by reading the resource and walking its label-encoded ancestry, not by interpreting the URL structure.
+
+**Principal completion.** Because organisation and project are no longer present in the URL, write-path handlers must complete the principal context before writing audit, quota, or attribution fields or making any downstream call. The mechanism depends on the resource type: for a root resource, the caller supplies organisation and project in the request body; for a child resource, the handler reads the parent resource and infers organisation and project from its labels. In both cases completion must happen before any downstream call is made.
+
+> **Rationale:** Hierarchical URL routing encodes tenancy structure into the API surface. As the platform's resource graph grows more complex — resources owned by one project but consumed by another, cross-region references, platform-managed resources attributed to an org — a hierarchy-in-URL model cannot express these relationships without becoming incoherent. Flat routing with label-encoded scope decouples the API surface from the tenancy model and allows the resource graph to evolve independently.
+
 ---
 
 ## 8. Controller Behaviour
@@ -637,6 +679,18 @@ The deadlock log entry must include as structured fields: resource type, resourc
 The deadlock threshold is **10 minutes**. A resource holding a deletion timestamp for longer than 10 minutes with references still present is anomalous and warrants operator attention.
 
 Forcibly clearing a reference to resolve a deadlock must only be done by an operator who has identified why the reference is held and confirmed that the holding controller will not resume and attempt to use the resource.
+
+### 8.9 Status Projection and Monitoring
+
+Controllers are event-driven: resource status is updated in response to watch events and reconcile passes. This model is correct for lifecycle state that the platform itself controls — provisioning, deletion, reference management.
+
+It is not sufficient for state that lives in the cloud provider and changes independently of platform operations. Power state, health, and other runtime characteristics of cloud resources can only be known by querying the provider directly. Waiting for a lifecycle event to trigger a reconcile would mean that status reflects the last time the controller ran, not the current reality.
+
+Services that manage cloud resources therefore run a monitor process alongside the controller. The monitor polls provider APIs on a periodic schedule and projects the observed state back into resource status. The controller sets the initial observed state — including initial power state — as part of provisioning; the monitor is responsible for keeping that observed state current on subsequent polls. If the provider is unreachable during a poll cycle, the monitor aborts without modifying status; the last observed state is preserved until the provider becomes reachable again.
+
+A new service that manages cloud resources must account for both. Relying solely on controller reconciles to reflect provider reality is insufficient.
+
+> **Current limitation:** There is no formal ownership partitioning of `status.conditions` between the controller and the monitor. Both write to the same condition list; the last writer wins. By convention the controller writes lifecycle conditions and the monitor writes observed-state conditions, but this partitioning is not enforced by the framework.
 
 ---
 
