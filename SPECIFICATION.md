@@ -59,6 +59,7 @@ Nscale Cloud Platform Engineering
    - [7.8 List Filtering](#78-list-filtering)
    - [7.9 Error Handling and Propagation](#79-error-handling-and-propagation)
    - [7.10 v2 API Design Model](#710-v2-api-design-model)
+   - [7.11 OpenAPI-First Development](#711-openapi-first-development)
 8. [Controller Behaviour](#8-controller-behaviour)
    - [8.1 The Work Queue](#81-the-work-queue)
    - [8.2 Transient Conditions and Silent Retry](#82-transient-conditions-and-silent-retry)
@@ -87,6 +88,10 @@ Nscale Cloud Platform Engineering
 - [A.4 Update Saga Revert — Broken Compensation](#a4-update-saga-revert--broken-compensation)
 - [A.5 Multi-Step Create With No Saga — Orphaned Cross-Service Resources](#a5-multi-step-create-with-no-saga--orphaned-cross-service-resources)
 - [A.6 Allocation Ownership Inversion](#a6-allocation-ownership-inversion)
+
+**Appendix B**
+
+- [B.1 Checklist: Building a New Service](#b1-checklist-building-a-new-service)
 
 ---
 
@@ -193,6 +198,8 @@ The ACL endpoint returns the union of all role scopes for a principal. Every ser
 Protected roles (`protected: true`) are not visible via the public API and may only be granted via Helm values at deployment time. These roles gate privileged platform operations.
 
 Every public API endpoint requires authentication. The only unauthenticated endpoints are OIDC discovery and login flows.
+
+**System account RBAC role registration.** When a new service is introduced, its system account certificate CN must be mapped to an RBAC role. This mapping is configured at deployment time via Helm values in the Identity service — it is not self-configured by the service. The role must be scoped to the minimum permissions required: declare only the `(resource, operation)` pairs the service actually exercises. Over-permissioned system account roles are a security defect. The CN-to-role mapping is the sole mechanism by which a service acquires its effective permissions; no other route exists.
 
 ### 4.4 Principals and Proxies
 
@@ -442,7 +449,7 @@ Adding a new resource type to the graph is a formal exercise. For each relations
 - Resource identifiers are UUID v4 (random), generated at creation time. They are globally unique and immutable for the lifetime of the resource. A resource ID is never reused, reassigned, or modified. UUID v5 (deterministic) is used only for index resources whose sole purpose is uniqueness enforcement — never for resources carrying billing, quota, or audit identity. See [Appendix A.1](#a1-toctou-race--resource-name-uniqueness).
 - Human-readable names are stored in `metadata.labels[<platform-label-prefix>/name]` and are mutable. Never hardcode resource names.
 - Resource status is expressed exclusively via `status.conditions`, following the `metav1.Condition` schema with strongly-typed reason constants. There is no authoritative phase field — conditions are the sole source of truth for resource state.
-- All write operations are asynchronous (202 Accepted). Always read `status.conditions` before acting on resource state.
+- Resource provisioning operations (create, update, delete) are asynchronous — they return `202 Accepted` immediately and a controller drives them to completion. Reference operations and reads are synchronous. Always read `status.conditions` before acting on resource state.
 
 ### 6.2 Labels and Annotations
 
@@ -506,6 +513,7 @@ Every server handler must perform the following steps in order:
 5. For **update**: read the current resource (`GetRaw`), re-derive labels and annotations from the current resource's own label values, patch with optimistic locking (`MergeFromWithOptimisticLock`). Never carry labels or annotations from the request body.
 6. For **delete**: verify `DeletionTimestamp` is nil before issuing the delete. If already set, return `202` idempotently.
 7. Propagate the principal into the request context before any downstream service call or resource write.
+8. For **create** with a per-network uniqueness constraint: create the index resource (UUID v5, deterministic) before the main resource. If the index creation returns `409`, return `409` immediately and do not create the main resource. Register a compensating saga action to delete the index entry before executing the main resource create. See [Appendix A.1](#a1-toctou-race--resource-name-uniqueness).
 
 #### 7.2.1 Handler Authentication Classification
 
@@ -531,7 +539,7 @@ The canonical server setup defines two ordered middleware groups.
 1. **`audit.Middleware`** — registered first, therefore outermost. Wraps the full post-routing chain. Emits the audit log entry after the inner chain completes.
 2. **`validator.Middleware`** — registered second, therefore innermost (runs first). Validates the request against the OpenAPI schema and performs token introspection and principal population. Authentication failure returns `401`/`403` before the handler is reached.
 
-> **Compliance:** `uni-region` is compliant with this section. Any new service joining the platform must replicate this stack exactly. Deviations must be approved and documented here.
+All platform services must replicate this middleware stack exactly. Deviations must be approved and documented here.
 
 ### 7.3 Conflict Detection
 
@@ -572,7 +580,7 @@ The saga pattern from the core library must be used for any handler operation th
 
 ### 7.6 Quota and Strongly Consistent Allocations
 
-The platform quota system tracks consumption of arbitrary, service-defined resource kinds. Quota limits are set at the organisation level.
+The platform quota system tracks consumption of arbitrary, service-defined resource kinds. Quota limits are set at the organisation level. A new service that introduces a user-accountable resource type must declare a new quota kind in the Identity service's quota schema and configure a default limit at deployment time via Helm values. The quota kind string is the canonical name used in all allocation and reservation operations for that resource type — it must be stable for the lifetime of the service.
 
 Quota allocation uses a two-phase reservation model. The handler makes a soft reservation synchronously. The controller promotes the reservation to a committed allocation and owns the full allocation lifecycle.
 
@@ -591,6 +599,8 @@ Quota allocation uses a two-phase reservation model. The handler makes a soft re
 - Major version bumps — paradigm shifts rather than incremental changes — should be coordinated across all services simultaneously. The v2 release is the canonical example of a coordinated major bump.
 
 ### 7.8 List Filtering
+
+> **Note:** This section describes the v1 list filtering model, retained for reference only. The v2 model ([section 7.10](#710-v2-api-design-model)) supersedes it for all new services. Do not design new list operations against the v1 model.
 
 - List operations filter by organisation and project via label selectors derived from the principal's ACL.
 - Post-list RBAC filtering (`rbac.AllowProjectScope`) is applied in-process where label selectors alone cannot encode the access policy.
@@ -641,9 +651,36 @@ The v2 API is the target design for all platform services. New services must fol
 
 > **Rationale:** Hierarchical URL routing encodes tenancy structure into the API surface. As the platform's resource graph grows more complex — resources owned by one project but consumed by another, cross-region references, platform-managed resources attributed to an org — a hierarchy-in-URL model cannot express these relationships without becoming incoherent. Flat routing with label-encoded scope decouples the API surface from the tenancy model and allows the resource graph to evolve independently.
 
+### 7.11 OpenAPI-First Development
+
+The OpenAPI specification is the source of truth for every service API. All server stubs, client SDKs, request validation, and middleware routing are generated from it. The implementation must conform to the spec — the spec is never updated retroactively to match the implementation.
+
+**When building a new service, the OpenAPI spec is the first artefact to write.** Before any Go code is authored:
+
+1. Define all resource types, request/response schemas, and endpoint paths in the OpenAPI YAML.
+2. Annotate each operation with the correct authentication classification: default (public), `x-internal: true` (service principal), or `x-internal: true` + `x-principal: delegated` (delegated principal). These annotations drive middleware behaviour directly — incorrect annotations produce incorrect enforcement.
+3. Declare all `4xx` and `5xx` responses the operation can produce. The OpenAPI validator will reject responses that are not declared.
+4. Run code generation. Server stubs, client types, and the validator configuration are all derived from the spec.
+
+**OpenAPI annotations that drive middleware behaviour:**
+
+| Annotation | Effect |
+|---|---|
+| *(none)* | Public endpoint. Middleware enforces OAuth2 bearer token. Principal derived from token introspection. |
+| `x-internal: true` | Internal endpoint. Middleware enforces mTLS client certificate. Bearer token rejected. |
+| `x-internal: true` + `x-principal: delegated` | Delegated endpoint. Middleware enforces mTLS and asserts a propagated user principal is present. RBAC resolves against the user, not the mTLS CN. |
+
+Service authors must not implement authentication logic in handlers. Authentication and principal population are entirely the middleware's responsibility. A handler that checks the bearer token itself or constructs a principal from headers is a defect.
+
 ---
 
 ## 8. Controller Behaviour
+
+A service hosts one or more controllers in a single process. The process is bootstrapped via `pkg/manager.Run`, which initialises the Kubernetes client, registers all controller types, and starts the controller-runtime manager. Each controller type is registered through a factory function (conventionally `ControllerFactory`) that wires its watches and reconciler into the manager before startup.
+
+Each controller manages exactly one resource type. The reconciler is a function that takes a resource and drives it from its current observed state toward its desired state. The manager calls the reconciler when a watch event or a requeue fires. Multiple reconcilers within the same process share the Kubernetes client and the event bus subscription infrastructure, but otherwise operate independently.
+
+> **Why this matters for new services:** a new service that manages N resource types requires N controllers, all registered in the same `pkg/manager.Run` call. Splitting controllers across processes is not the pattern and introduces unnecessary operational complexity.
 
 ### 8.1 The Work Queue
 
@@ -686,8 +723,14 @@ If the status write itself fails (e.g. due to a resource version conflict), the 
 
 ### 8.5 Finalizer Lifecycle
 
-- On creation or update: the controller adds its finalizer to the resource before performing any provisioning work.
-- On deletion: the resource is tombstoned with a deletion timestamp. The controller detects this, retries silently while references and owned children exist, runs deprovisioning, and only removes the finalizer once deprovisioning is complete.
+Every reconcile pass must check the deletion timestamp before taking any other action. The ordering is not optional:
+
+1. **Check `DeletionTimestamp`** — if set, the resource is being deleted. Jump immediately to the deprovisioning path; skip all provisioning logic.
+2. **Deprovisioning path** — run the deprovision sequence (release references, delete owned children, release quota allocation). When deprovisioning is complete, remove the finalizer. The resource is then eligible for garbage collection.
+3. **If `DeletionTimestamp` is not set** — ensure the finalizer is present; add it unconditionally if absent. The handler adds it at creation time; the controller adds it here as an unconditional guarantee that covers any gap. Proceed to provisioning.
+4. **Provisioning path** — with the finalizer confirmed present, proceed with provisioning.
+
+Provisioning without first ensuring the finalizer is present is a defect. It creates a window in which deletion can bypass the deprovisioning path entirely.
 
 ### 8.6 Controller Watches
 
@@ -757,6 +800,8 @@ Audit logging is mandatory for all authenticated, scoped, state-mutating API ope
 - Unauthenticated requests must not be audit logged.
 - Requests without organisational scope must not be audit logged.
 
+Audit log entries are emitted automatically by `audit.Middleware` (see [section 7.2.2](#722-server-middleware-stack)). Service authors do not write audit log entries manually. The middleware wraps the full post-routing chain and emits the entry after the handler returns, capturing the outcome. Any handler that bypasses the middleware stack will silently produce no audit trail — this is a defect.
+
 Every audit log entry must carry the following structured fields:
 
 | Field | Value |
@@ -767,7 +812,7 @@ Every audit log entry must carry the following structured fields:
 | `component` | Service name and version |
 | `actor` | Principal subject |
 | `operation` | HTTP verb |
-| `scope` | `organisationID` and `projectID` from path |
+| `scope` | `organisationID` and `projectID` resolved from the request context (not parsed from the URL path — in v2 they may not be present in the path) |
 | `resource` | Resource type and ID |
 | `result` | HTTP status code |
 
@@ -968,3 +1013,75 @@ Pagination has not yet been implemented. This is a known scaling limitation.
 - `provisioner.Deprovision` does not call `identityclient.NewAllocations.Delete`, or contains a TODO noting the omission.
 
 **Required pattern:** `handler.Delete` must not release the allocation. It deletes only the local resource (setting the deletion timestamp). The controller's deprovision path is solely responsible for releasing the allocation before removing its finalizer.
+
+---
+
+## Appendix B: Reference Checklists
+
+### B.1 Checklist: Building a New Service
+
+Use this checklist when introducing a new service to the platform. Each item maps to a section of this specification. An item is complete only when the implementation is in code, not merely planned.
+
+**API Design**
+- [ ] OpenAPI spec written first, before any Go code ([§7.11](#711-openapi-first-development))
+- [ ] Every endpoint annotated with its authentication classification (`x-internal`, `x-principal: delegated`, or default) ([§4.5.1](#451-api-authentication-classifications), [§7.2.1](#721-handler-authentication-classification))
+- [ ] All possible `4xx`/`5xx` responses declared in the OpenAPI spec ([§7.9](#79-error-handling-and-propagation))
+- [ ] API follows the v2 flat routing model; no organisation/project in URL path ([§7.10](#710-v2-api-design-model))
+- [ ] Server stubs, client types, and validator generated from the OpenAPI spec
+
+**Handlers**
+- [ ] Every handler satisfies the middleware prerequisites, general invariant, and per-operation rules of [§7.2](#72-handler-layer-responsibilities)
+- [ ] Labels and annotations set exclusively via `conversion.NewObjectMetadata` / `conversion.UpdateObjectMetadata` ([§6.2](#62-labels-and-annotations))
+- [ ] All three label categories populated: scope, ancestry, attribution ([§6.2](#62-labels-and-annotations))
+- [ ] Principal propagated into context before any downstream call ([§4.5](#45-principal-propagation))
+- [ ] v2 services: organisation and project completed before any downstream call — root resource from request body, child resource from parent resource labels ([§4.4](#44-principals-and-proxies), [§7.10](#710-v2-api-design-model))
+- [ ] Every user-supplied resource ID (URL param, query param, body field) has an authorization check before business logic executes ([§7.2](#72-handler-layer-responsibilities), [§10.1](#101-platform-security-invariants))
+- [ ] ACL-restricted or scoped-visibility resources return `404` for both non-existence and access denial — never `403` ([§7.9](#79-error-handling-and-propagation))
+- [ ] No caching of caller-scoped (impersonated, RBAC-filtered) responses in downstream consumers ([§10.1](#101-platform-security-invariants))
+- [ ] Multi-step creates use a saga with compensating transactions for each side-effectful step ([§7.5](#75-multi-step-operations-sagas))
+- [ ] Per-network uniqueness enforced via UUID v5 index resource, not list-then-check ([Appendix A.1](#a1-toctou-race--resource-name-uniqueness))
+- [ ] Error responses constructed via core library helpers only; never manually constructed ([§7.9](#79-error-handling-and-propagation))
+
+**RBAC and Security**
+- [ ] System account CN-to-role mapping configured in Identity service Helm values ([§4.3](#43-rbac))
+- [ ] System account role declares only the minimum required `(resource, operation)` pairs ([§4.3](#43-rbac))
+- [ ] Ingress configured to strip `X-Principal` and `X-Impersonate` headers from external requests ([§10.1](#101-platform-security-invariants))
+
+**Quota** *(if the service introduces user-accountable resources)*
+- [ ] New quota kind declared in Identity service quota schema ([§7.6](#76-quota-and-strongly-consistent-allocations))
+- [ ] Default quota limit configured via Helm values at deployment time ([§7.6](#76-quota-and-strongly-consistent-allocations))
+- [ ] Handler creates soft reservation; controller promotes and releases ([§7.6](#76-quota-and-strongly-consistent-allocations))
+
+**Resource Graph**
+- [ ] All edge types declared: for each relationship, the primitive properties are identified ([§5.10](#510-defining-a-new-resource-type))
+- [ ] Scope, ancestry, and attribution labels correct for each edge type ([§6.2](#62-labels-and-annotations))
+- [ ] Co-location constraint enforced at create time for consumption and dependency edges ([§5.10](#510-defining-a-new-resource-type))
+- [ ] Cross-service deletion propagation uses the event bus, not direct storage subscription ([§5.4](#54-event-bus), [§5.9](#59-deletion-propagation-mechanisms))
+- [ ] References placed and released by the controller, never the handler ([§5.3](#53-references))
+
+**Controllers**
+- [ ] All controllers registered via `pkg/manager.Run` in a single process ([§8](#8-controller-behaviour))
+- [ ] Each reconcile pass checks `DeletionTimestamp` first; finalizer added unconditionally before provisioning ([§8.5](#85-finalizer-lifecycle))
+- [ ] Every reconcile pass writes `status.conditions` unconditionally before returning ([§8.4](#84-status-conditions))
+- [ ] Transient conditions return `ErrYield`; genuine errors returned as errors ([§8.2](#82-transient-conditions-and-silent-retry), [§8.3](#83-genuine-errors))
+- [ ] Reconciliation is idempotent; handles duplicate events without side effects ([§8.1](#81-the-work-queue))
+- [ ] Status propagation upward implemented via explicit watch or event bus subscription ([§5.8](#58-status-propagation), [§8.6](#86-controller-watches))
+- [ ] Deletion deadlock detection emits structured log after 10-minute threshold ([§8.8](#88-deletion-deadlock-detection))
+
+**Cloud Resource Services** *(if the service manages cloud provider resources)*
+- [ ] Monitor process implemented alongside the controller for observed runtime state ([§8.9](#89-status-projection-and-monitoring))
+
+**Middleware Stack**
+- [ ] Server initialised with the canonical pre-routing middleware in order: OTel → Logging → Route Resolver → CORS ([§7.2.2](#722-server-middleware-stack))
+- [ ] Post-routing middleware registered in order: `audit.Middleware` first, `validator.Middleware` second ([§7.2.2](#722-server-middleware-stack))
+
+**Observability**
+- [ ] Uber zap structured logging initialised; controller-runtime logger set to zap backend ([§9.1](#91-structured-logging))
+- [ ] Process bootstrapped via `pkg/options` for logging, OpenTelemetry, and namespace configuration ([§11](#11-core-library))
+- [ ] OpenTelemetry spans created for all inbound requests and controller reconcile passes ([§9.3](#93-distributed-tracing))
+- [ ] Prometheus metrics exposed: reconcile duration, reconcile outcome, work queue depth ([§9.4](#94-metrics))
+- [ ] Audit logging emitted automatically by `audit.Middleware`; no manual audit writes in handlers ([§9.2](#92-audit-logging))
+
+**Data Boundaries**
+- [ ] Service accesses no other service's storage directly; all cross-service reads/writes via versioned API ([§3](#3-data-boundaries))
+- [ ] Intra-service owner references used for containment; cross-service references use the event bus ([§5.9](#59-deletion-propagation-mechanisms))
