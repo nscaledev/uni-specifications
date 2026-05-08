@@ -14,6 +14,7 @@ Nscale Cloud Platform Engineering
 2. [Platform Model](#2-platform-model)
    - [2.1 Services and Owned Resources](#21-services-and-owned-resources)
    - [2.2 Service Dependency Order](#22-service-dependency-order)
+   - [2.3 Service Layering and Resource Accountability](#23-service-layering-and-resource-accountability)
 3. [Data Boundaries](#3-data-boundaries)
 4. [Identity and Access](#4-identity-and-access)
    - [4.1 Organisational Hierarchy](#41-organisational-hierarchy)
@@ -113,6 +114,21 @@ The Nscale Cloud Platform is a cloud-agnostic PaaS for AI/ML workloads. Each ser
 Identity Service  ←  Region Service  ←  Compute Service
                                      ←  Kubernetes Service
 ```
+
+### 2.3 Service Layering and Resource Accountability
+
+Higher-order services build on lower-order services by following a consistent layering pattern: the higher-order service owns its own resource (enforcing the data boundary), drives the lower-order service's resource through its versioned API, and projects status back up from the lower-order resource into its own.
+
+The lower-order resource is an implementation detail of the higher-order service. It is not exposed to users and is not user-managed. Users interact only with the resource the higher-order service owns.
+
+**Quota and billing accountability is conferred by the service layer, not by the underlying primitive.** The same lower-order resource can be either user-accountable or a platform-managed resource carrying no quota or billing significance, depending on which service provisioned it:
+
+- The Compute service provisions `region.Server` resources via the Region API and wraps them in `ComputeInstance`. Quota is charged and billing is attributed at the `ComputeInstance` layer. The `region.Server` itself carries no billing significance.
+- The Kubernetes service provisions `region.Server` resources directly via the Region API for cluster nodes. These servers are scoped to the organisation but bypass the Compute accounting layer entirely — no quota is charged and no billing applies. They are platform-managed infrastructure.
+
+The rule for new services follows directly: if the infrastructure being provisioned is platform-managed and not directly requested by the user, provision it directly from Region. If it is user-requested and user-accountable, wrap it in a service-owned resource that carries the quota and billing responsibility.
+
+> **Rationale:** Placing accountability at the primitive layer would mean all servers — whether user-requested or platform-managed — would consume quota. That would make Kubernetes cluster nodes count against user quota, which is wrong. Placing accountability at the service layer allows the same infrastructure primitive to serve both purposes without conflating them.
 
 ---
 
