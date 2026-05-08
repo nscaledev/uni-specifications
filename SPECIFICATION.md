@@ -164,9 +164,18 @@ Every public API endpoint requires authentication. The only unauthenticated endp
 
 ### 4.4 Principals and Proxies
 
-A **principal** is the originating end-user responsible for a resource. The principal determines quota attribution and billing. Once set on a resource it is immutable.
+Four concerns govern how a principal relates to a resource. They are distinct and must never be conflated:
 
-A **proxy** is a service provisioning resources on behalf of a principal. The proxy carries its own service identity for transport authentication, but the principal it is acting for is propagated separately in the request context.
+| Concern | Definition |
+|---|---|
+| **Attribution** | Who originated the work. The principal recorded on a resource at creation time. Determines quota and billing. Immutable. |
+| **Placement** | Where the resource lives. The organisation and project that own the resource in the tenancy hierarchy. A proxy may provision resources in its own tenancy while attributing them to the user — attribution and placement can differ. |
+| **Visibility** | Whether the principal can see the resource. Governed by RBAC scope. A principal may be the attributed owner of a resource without having the RBAC scope to list or read it. Attribution does not imply visibility. |
+| **Effective authorization** | What the principal is permitted to do. Derived from the ACL at request time. Separate from both attribution and visibility. |
+
+A **principal** is the actor identified by the attribution concern. The principal determines quota and billing. Once recorded on a resource it is immutable.
+
+A **proxy** is a service provisioning resources on behalf of a principal. The proxy carries its own system account identity for transport authentication, but the principal it is acting for is propagated separately in the request context.
 
 At the public API boundary, the principal is derived from token introspection (the actor claim) combined with the organisation and project from the HTTP path. This derivation happens once, at the boundary, and the result is threaded through all downstream processing.
 
@@ -176,7 +185,7 @@ A proxy may provision resources in its own tenancy or in the principal's tenancy
 
 - Every outbound service-to-service call must propagate the principal from the current request context.
 - Every resource created must persist the principal as an immutable field.
-- Every controller calling another service must propagate the principal from the resource under reconciliation — not from the service's own identity.
+- Every controller calling another service must propagate the principal from the resource under reconciliation — not from the service's own identity. Controllers operate outside the request/response cycle and have no live request context; the principal is reconstructed from the resource's persisted labels.
 - Quota allocations must be made against the principal, never the proxy service.
 
 #### 4.5.1 API Authentication Classifications
