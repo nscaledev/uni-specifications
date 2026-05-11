@@ -504,16 +504,20 @@ The distinction between synchronous and asynchronous operations reflects whether
 
 ### 7.2 Handler Layer Responsibilities
 
-Every server handler must perform the following steps in order:
+**Prerequisites** (enforced in order before any business logic executes):
 
 1. Introspect the bearer token against the identity service to establish the principal.
 2. Retrieve the ACL for the principal and enforce the required scope and CRUD permission for the operation.
-3. Validate the request body against the OpenAPI schema (performed by middleware before the handler is invoked).
-4. For **create**: derive all labels and annotations via `conversion.NewObjectMetadata`. Never accept labels or annotations from the request body.
-5. For **update**: read the current resource (`GetRaw`), re-derive labels and annotations from the current resource's own label values, patch with optimistic locking (`MergeFromWithOptimisticLock`). Never carry labels or annotations from the request body.
-6. For **delete**: verify `DeletionTimestamp` is nil before issuing the delete. If already set, return `202` idempotently.
-7. Propagate the principal into the request context before any downstream service call or resource write.
-8. For **create** with a per-network uniqueness constraint: create the index resource (UUID v5, deterministic) before the main resource. If the index creation returns `409`, return `409` immediately and do not create the main resource. Register a compensating saga action to delete the index entry before executing the main resource create. See [Appendix A.1](#a1-toctou-race--resource-name-uniqueness).
+3. For **any user-supplied resource ID** (URL path parameter, query parameter, or request body field referencing a resource owned by this or another service): fetch the referenced resource, derive its tenancy scope (org/project) from its labels, and verify the caller's ACL (from step 2) permits the required operation at that scope. This is the same check applied on every read and list path. It is necessary in addition to step 2 because the resource's tenancy scope is not known until the resource is fetched — in v2 APIs the URL contains only a UUID, not org/project. No shortcuts: the check must be performed even if the resource type is already covered by step 2. See [section 10.1](#101-platform-security-invariants) — input-path authorization invariant.
+4. Validate the request body against the OpenAPI schema (performed by middleware before the handler is invoked).
+
+**General handler invariant:** The principal must be complete — including org/project — before any downstream service call or resource write. For v2 services this means completing the principal context from the request body or parent resource labels ([§4.4](#44-principals-and-proxies)) before any business logic proceeds.
+
+**Create:** Derive labels and annotations via `conversion.NewObjectMetadata` from the resolved organisational context (URL path parameters for v1; request body or parent resource labels for v2) and the authenticated principal. Never copy labels or annotations verbatim from the request body. Add the controller's finalizer to the resource metadata before any controller is able to observe the resource.
+
+**Update:** Read the current resource (`GetRaw`), re-derive labels and annotations via `conversion.UpdateObjectMetadata` using the current resource's own label values as inputs. Never copy labels or annotations verbatim from the request body. Patch with optimistic locking (`MergeFromWithOptimisticLock`).
+
+**Delete:** Verify `DeletionTimestamp` is nil before issuing the delete. If already set, return `202` idempotently.
 
 #### 7.2.1 Handler Authentication Classification
 
@@ -630,7 +634,7 @@ Every error response body carries: `error` (machine-readable code), `error_descr
 **Security rules:**
 
 - Error descriptions must contain only what the legitimate user needs to take corrective action. They must not contain implementation details, infrastructure topology, library or framework identities, file paths, or internal hostnames. (OWASP API Security Top 10 API8:2023, CWE-209)
-- Where revealing that a resource exists would constitute a data boundary violation, return `404` uniformly regardless of whether the actual cause is non-existence or forbidden access. Never use `403` as an existence oracle. (OWASP WSTG-ERRH-01, CWE-208)
+- Where revealing that a resource exists would constitute a data boundary violation, or where the resource has scoped visibility (ACL-restricted, impersonation-filtered), return `404` uniformly regardless of whether the actual cause is non-existence or forbidden access. Never use `403` as an existence oracle. Phrasing such as "resource does not exist or is not accessible" is equally prohibited — distinguishing the two cases leaks existence information. (OWASP WSTG-ERRH-01, CWE-208)
 - Authentication error responses must not distinguish between an unknown principal and an incorrect credential. Both return `401 access_denied` with a non-specific description. (OWASP WSTG-ERRH-02)
 - Error descriptions must never reference resources, identifiers, or state belonging to a scope the requesting principal cannot access.
 - When a handler calls a downstream service and receives an error response, it must propagate the typed error faithfully. A `403` from downstream propagates as `403` to the end user.
@@ -866,6 +870,8 @@ The following invariants apply unconditionally to all platform components. Any i
 - **Single enforcement point** — all access decisions are made against the ACL returned by the identity service. There is no local policy evaluation in individual services. Duplicating or caching access logic outside the ACL endpoint is a defect.
 - **Immutable attribution** — the principal recorded on a resource at creation time cannot be changed. Re-attribution is not permitted. See [section 4.4](#44-principals-and-proxies).
 - **Header stripping at ingress** — the platform ingress strips `X-Principal` and `X-Impersonate` headers from all inbound external requests before they reach any service. End users cannot inject or spoof principal propagation headers. The mTLS-based principal propagation model is only secure if the ingress enforces this boundary unconditionally.
+- **Input-path authorization (taint checking)** — A resource ID supplied by a caller in any position (URL path parameter, query parameter, request body field) is an untrusted input. The caller knowing a valid ID does not imply they are authorized to reference it. Every endpoint that accepts a caller-supplied resource ID must verify authorization for that specific resource before any business logic executes. Applying an ACL filter to a list response is not a substitute for this check: it covers only the output path. An attacker who learns a restricted resource's ID by any means — prior access, traffic observation, or enumeration — must be denied on the input path with the same outcome as if the resource did not exist. Any handler that performs an ACL check on its list response but not on its write or read-by-ID endpoints is a defect.
+- **Cache scope isolation** — A response produced under a caller-scoped authorization context (RBAC filtering, impersonation, organisation-scoped visibility) must never be served from a cache whose key is coarser than the full authorization scope. If the authorization scope cannot be fully expressed as a cache key, the cache must not exist at that layer. Caching of caller-scoped responses must be owned exclusively by the service that owns the authorization context. A downstream consumer that receives impersonated or filtered responses must not cache them — the cache key would be under-specified and a principal with broader access to the same key would serve restricted data to a principal with narrower access.
 
 ---
 
