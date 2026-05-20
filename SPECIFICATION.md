@@ -26,7 +26,8 @@ Nscale Cloud Platform Engineering
      - [4.5.1 API Authentication Classifications](#451-api-authentication-classifications)
    - [4.6 Principal Propagation Modes and Impersonation](#46-principal-propagation-modes-and-impersonation)
      - [4.6.1 ACL Intersection under Impersonation](#acl-intersection-under-impersonation)
-   - [4.7 Token Infrastructure](#47-token-infrastructure)
+   - [4.7 Federated Authentication](#47-federated-authentication)
+   - [4.8 Token Infrastructure](#48-token-infrastructure)
 5. [Resource Graph](#5-resource-graph)
    - [5.1 Edge Properties](#51-edge-properties)
    - [5.2 Edge Types by Property Intersection](#52-edge-types-by-property-intersection)
@@ -44,6 +45,7 @@ Nscale Cloud Platform Engineering
 6. [Resource Model](#6-resource-model)
    - [6.1 Naming and Metadata](#61-naming-and-metadata)
    - [6.2 Labels and Annotations](#62-labels-and-annotations)
+   - [6.3 Tags](#63-tags)
 7. [API Design](#7-api-design)
    - [7.1 Synchronous vs Asynchronous Operations](#71-synchronous-vs-asynchronous-operations)
    - [7.2 Handler Layer Responsibilities](#72-handler-layer-responsibilities)
@@ -267,7 +269,17 @@ The scope hierarchy rule follows from the above:
 - **Principle of least authority** — each service is confined to the subset of the user's permissions that the service itself is authorised for, regardless of the user's own role.
 - **Attribution-only callers unaffected** — services that set `X-Principal` without `X-Impersonate` continue to resolve RBAC against their own system account role only, with no change in behaviour.
 
-### 4.7 Token Infrastructure
+### 4.7 Federated Authentication
+
+The Identity service does not maintain a user credential store. All human authentication is federated to upstream OIDC providers. Each organisation configures one or more upstream providers via the `OAuth2Provider` resource. When a user authenticates, they are redirected to their organisation's provider, which performs credential verification. Identity exchanges the upstream provider's token for a platform token normalised to the internal format.
+
+The upstream provider's subject claim is the stable identity key. The same subject authenticating via the same provider is always the same platform user. A `User` resource records the global identity; an `OrganizationUser` resource records the membership and state (active, pending, suspended) within a specific organisation. A user may be a member of multiple organisations with independent states in each.
+
+The `OAuth2Client` resource represents a client application — such as the platform UI — that is permitted to initiate the OAuth2 authorisation code flow. Clients are organisation-scoped; a client registered in one organisation cannot be used to authenticate against another.
+
+> **Rationale:** Federation externalises credential management and MFA to the organisation's chosen identity provider, which is already trusted and likely already managing the user's other credentials. The platform does not need to solve password policies, MFA, or breach response — those are delegated. The platform only needs to trust the upstream assertion.
+
+### 4.8 Token Infrastructure
 
 The Identity service is the platform's OAuth2/OIDC authorization server. It does not merely validate tokens issued elsewhere — it issues all tokens used within the platform and is the trust root for all bearer-token-based authentication.
 
@@ -343,6 +355,8 @@ The event bus is a push-based messaging system through which services publish re
 - Event payloads are minimal: `resourceID` and optional `deletionTimestamp`. No resource state is embedded in the event. Subscribers must call the owning service's versioned API to retrieve current state. This preserves data boundaries — the event is a stimulus, not a data transfer.
 - The `deletionTimestamp` field allows subscribers to filter the stream and distinguish deletion events from creation or update events without an additional API call.
 - The event bus is the required mechanism for all cross-service deletion and status propagation. Intra-service propagation uses Kubernetes watches directly. The semantics are identical — only the plumbing differs.
+
+> **Implementation note:** The current backend is Kubernetes list/watch (`core/pkg/messaging/kubernetes`). This is the correct and only approved mechanism for cross-service event consumption — do not implement ad-hoc watch loops, poll loops, or direct subscriptions to another service's storage. The abstraction is designed so the backend can be replaced (Kafka, NATS, etc.) without changing consumer code or event semantics.
 
 ### 5.5 Containment
 
@@ -432,13 +446,40 @@ Adding a new resource type to the graph is a formal exercise. For each relations
 
 ### 6.2 Labels and Annotations
 
-- Labels and annotations are exclusively owned by the server handler layer (`generate()` / `conversion.NewObjectMetadata`).
+Labels are not decoration — they are the platform's query model. List operations, scope resolution, RBAC filtering, and resource ancestry traversal all rely on labels being present and correct. A resource with missing labels is not merely untidy; it is invisible to the operations that depend on those labels and may silently escape security filtering.
+
+Labels fall into three functional categories:
+
+| Category | Purpose | Examples |
+|---|---|---|
+| Scope | Encode the tenancy scope of the resource. Used by list operations and RBAC filtering. | organisation ID, project ID |
+| Ancestry | Encode the resource's position in the dependency graph. Required for multi-hop queries and co-location validation. | region ID, network ID, identity ID |
+| Attribution | Record who created the resource and on whose behalf. Used for billing, quota, and audit. | creator subject, principal organisation, principal project |
+
+All label keys use the platform label prefix defined in the core library constants. Services must not invent ad-hoc label keys. The full set of platform labels and their semantics is defined in `core/pkg/constants`.
+
+**Ownership rules:**
+- Labels and annotations are exclusively owned by the server handler layer via `conversion.NewObjectMetadata` (create) and `conversion.UpdateObjectMetadata` (update).
 - No controller, external process, or agent may add, modify, or remove them. Any externally-written values are silently overwritten on the next write.
 - Changes to label or annotation semantics require a revision to this specification before implementation.
+
+### 6.3 Tags
+
+Tags are user-defined key-value pairs attached to resources via `spec.tags`. They are distinct from labels: they are user-visible, user-controlled, and have no effect on RBAC, scoping, or query behaviour.
+
+Tags are used for user-defined resource organisation — cost attribution, environment markers, team ownership. They are applied as a post-list filter in-process after storage retrieval; they are not expressed as storage-level selectors. This means tag filtering does not reduce the storage query cost and cannot be used as a substitute for scope labels.
+
+**Platform-reserved tag keys.** The platform currently uses reserved tag keys within service-owned namespaces (e.g. `compute.unikorn-cloud.org/instance-id`) for internal resource linkage — for example, to recover the backing `region.Server` for a `ComputeInstance` without storing an explicit foreign key. These reserved keys are managed exclusively by the platform, must not be set by users or agents, and are stripped from user-supplied payloads before being re-applied by the platform.
+
+**Intended direction.** The use of tags for internal linkage is a transitional pattern. `spec.tags` should converge to being exclusively user-facing: values that are opaque to the platform and used only for user-defined resource organisation. Internal resource linkage should move to explicit labels (§6.2) or stored spec fields. Any new service that needs internal resource coordination must use labels or explicit spec fields — not tags.
 
 ---
 
 ## 7. API Design
+
+API handlers operate over Kubernetes objects without transactional guarantees. Multi-object handler operations are not atomic: a failure mid-sequence leaves partial state that may require controller-driven or idempotent-retry cleanup. Sagas ([§7.5](#75-multi-step-operations-sagas)) are the mitigation on create and update paths where partial completion must be rolled back on failure.
+
+Controllers are idempotent and eventually consistent by design — this is the intended model, not a limitation. The requeue mechanism and idempotent reconcile loop handle partial progress naturally without requiring atomic operations.
 
 ### 7.1 Synchronous vs Asynchronous Operations
 
@@ -611,7 +652,7 @@ The work queue decouples event production from event processing. Events are prod
 Processing is the reconcile function. It runs to completion and then the item is removed from the queue. There is no streaming, no callback, no blocking wait inside the function — if the controller cannot proceed, it returns and puts itself back on the queue.
 
 - Reconciliation must be idempotent.
-- If a resource has been paused, the controller must skip reconciliation entirely and return immediately without requeuing.
+- If a resource has been paused, the controller must skip reconciliation entirely and return immediately without requeuing. Pause is an operator escape hatch, set via annotation, that halts all reconciliation on a resource for maintenance or debugging. A paused resource remains in whatever condition it was in when paused.
 
 ### 8.2 Transient Conditions and Silent Retry
 
@@ -779,6 +820,7 @@ The following invariants apply unconditionally to all platform components. Any i
 - **Scope confinement** — access granted at a narrower scope (project, organisation) does not implicitly confer access at a broader scope. The scope hierarchy is strictly one-directional: broader grants cover narrower scopes, never the reverse. See [section 4.3](#43-rbac).
 - **Single enforcement point** — all access decisions are made against the ACL returned by the identity service. There is no local policy evaluation in individual services. Duplicating or caching access logic outside the ACL endpoint is a defect.
 - **Immutable attribution** — the principal recorded on a resource at creation time cannot be changed. Re-attribution is not permitted. See [section 4.4](#44-principals-and-proxies).
+- **Header stripping at ingress** — the platform ingress strips `X-Principal` and `X-Impersonate` headers from all inbound external requests before they reach any service. End users cannot inject or spoof principal propagation headers. The mTLS-based principal propagation model is only secure if the ingress enforces this boundary unconditionally.
 
 ---
 
@@ -786,7 +828,23 @@ The following invariants apply unconditionally to all platform components. Any i
 
 Before implementing any pattern in a platform service, check the core library. Reimplementing existing patterns is a defect.
 
-The core library is not a deployed service. It is a shared Go library that provides the canonical implementations of all platform design patterns — including the work queue, saga, quota reservation, reference management, middleware stack, error types, and all RBAC helpers. If a pattern is described in this specification, its reference implementation is in the core library.
+The core library is not a deployed service. It is a shared Go library that provides the canonical implementations of all platform design patterns. If a pattern is described in this specification, its reference implementation is in the core library. The package map below is the index — read the package README before writing any cross-cutting logic.
+
+| Package | Provides |
+|---|---|
+| `pkg/apis/unikorn/v1alpha1` | Managed resource interfaces (`ManagableResourceInterface`, `ReconcilePauser`, `StatusConditionReader`, `StatusConditionWriter`). Shared value types: `SemanticVersion`, `IPv4Address`, `Tag`. The canonical condition vocabulary. All resources participating in the controller/provisioner lifecycle must implement these interfaces. |
+| `pkg/client` | Kubernetes client construction. mTLS HTTP client setup from cert-manager secrets. Do not construct clients ad hoc. |
+| `pkg/constants` | Platform-wide metadata label keys and annotation keys. The `Finalizer` constant. `DefaultYieldTimeout`. `LabelPriorities` — the canonical ordering for label-tuple identity paths. Any new label or annotation key must be added here. |
+| `pkg/errors` | Sentinel errors: `ErrConsistency`, `ErrResourceNotFound`, `ErrConflict`. Wrap with `%w`; branch with `errors.Is`. |
+| `pkg/manager` | Controller-runtime integration. The generic `Reconciler`. Resource reference helpers. `ResourceReady()` — returns `ErrYield` when a dependency is not yet provisioned; use this rather than polling a downstream service. |
+| `pkg/messaging` | Event bus publisher and consumer. Use for all cross-service deletion and status propagation. Do not subscribe to another service's storage directly. |
+| `pkg/options` | Process bootstrap: namespace, logging (zap + controller-runtime), OpenTelemetry (tracer, meter, OTLP export). All services use this as their startup base. |
+| `pkg/provisioners` | The `Provisioner` interface and `ErrYield`. Combinators: `serial` (ordered, stop on first yield), `concurrent` (parallel, independent children), `conditional` (provision or actively deprovision based on a predicate). Use combinators to compose complex provisioning logic rather than writing ad hoc orchestration. |
+| `pkg/server/conversion` | `NewObjectMetadata` (create path) and `UpdateObjectMetadata` (update path) for constructing and mutating platform-standard resource metadata. Status mapping: deletion takes precedence over provisioning state. Tag conversion between Kubernetes and OpenAPI representations. |
+| `pkg/server/errors` | Canonical error constructors: `HTTPNotFound`, `HTTPConflict`, `AccessDenied`, `OAuth2InvalidRequest`. `HandleError` normalises arbitrary failures to the platform error contract. `PropagateError` adapts generated OpenAPI client error responses. Never construct error responses manually. |
+| `pkg/server/middleware` | Pre-routing middleware components: OpenTelemetry, logging, route resolver, CORS. These are the components assembled in §7.2.2. |
+| `pkg/server/saga` | Synchronous in-process saga coordinator. Best-effort rollback on failure. Use for any handler that produces side effects across multiple systems. |
+| `pkg/util` | `GenerateResourceID` — Kubernetes-safe random UUID v4. `ServiceDescriptor` — service name/version/revision for identity in logs and telemetry. |
 
 ---
 
@@ -806,6 +864,11 @@ The core library is not a deployed service. It is a shared Go library that provi
 | FINALIZING | Deletion state: children gone, releasing references on parent resources |
 | DELETED | Deletion state: all references released, resource garbage collected |
 | Group | Organisation-scoped collection of users and service accounts; the primary route to RBAC role assignment |
+| `infra-manager-service` | System account RBAC role held by the infrastructure manager service: read on regions; read and delete on identities and physical networks |
+| OAuth2Provider | Identity service resource representing an organisation's upstream OIDC provider configuration; the federation target for user authentication |
+| OAuth2Client | Identity service resource representing a client application permitted to initiate the OAuth2 authorisation code flow |
+| Pause | Operator annotation that halts all controller reconciliation on a resource. The resource remains in its current condition until unpaused. |
+| Tag | User-defined key-value metadata on a resource (`spec.tags`). User-defined values are opaque to the platform; platform-reserved keys in service namespaces (e.g. `compute.unikorn-cloud.org/*`) are used for internal resource coordination. Filtered post-list in-process. Does not affect RBAC, scoping, or storage queries. |
 | Identity (Region) | Cloud project/user/credentials provisioned by the Region service for a consuming service |
 | mTLS | Mutual TLS — both sides present certificates; all service-to-service auth |
 | OIDC | OpenID Connect — end-user authentication protocol |
