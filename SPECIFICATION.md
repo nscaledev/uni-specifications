@@ -101,9 +101,9 @@ The Nscale Cloud Platform is a cloud-agnostic PaaS for AI/ML workloads. Each ser
 
 | Service | Role | Owns |
 |---|---|---|
-| Identity | Identity Service | Organisation, Project, User, Group, Role, OAuth2Client |
-| Region | Region Service | Region, CloudIdentity, Network, PhysicalNetwork, ServerGroup |
-| Compute | Compute Service | Server |
+| Identity | Identity Service | Organisation, Project, User, OrganizationUser, Group, Role, ServiceAccount, OAuth2Provider, OAuth2Client, Quota, Allocation, SigningKey |
+| Region | Region Service | Region, Identity, Network, SecurityGroup, LoadBalancer, SSHCertificateAuthority, Server, FileStorage |
+| Compute | Compute Service | ComputeInstance |
 | Kubernetes | Kubernetes Service | ClusterManager, Cluster |
 | Core | Core Library | (shared library — no resources) |
 
@@ -141,17 +141,20 @@ An Organisation is the boundary of tenancy. Resources in one Organisation are ne
 
 ### 4.2 Actors and Representation
 
-Three distinct classes of actor interact with the platform:
+Four distinct classes of actor interact with the platform:
 
 | Actor | Representation |
 |---|---|
 | End User | A human operator authenticated via OIDC. Represented by a bearer token. Identity is established by token introspection at the public API boundary. |
-| Service Account | A platform service acting autonomously. Represented by an X.509 certificate whose Common Name maps to an RBAC role. All communication is exclusively via mTLS — the certificate is the identity. |
-| Proxy Service | A platform service acting on behalf of an end user. Carries both its own service identity (mTLS) and the originating user's principal (propagated in context). See [section 4.4](#44-principals-and-proxies). |
+| Service Account | An organisation-bound non-human identity managed within the Identity service. Authenticated via a bearer token issued by the Identity service. Authority is derived from group membership within the organisation, exactly as for end users. |
+| System Account | A platform service acting autonomously. Represented by an X.509 certificate whose Common Name maps to an RBAC role. All service-to-service communication is exclusively via mTLS — the certificate is the identity. |
+| Proxy Service | A platform service acting on behalf of an end user or service account. Carries both its own system account identity (mTLS) and the originating user's principal (propagated in context). See [section 4.4](#44-principals-and-proxies). |
 
 ### 4.3 RBAC
 
 RBAC roles are composed of endpoint scopes, each with a CRUD permission set. Roles may be scoped at three levels: global, organisation, or project.
+
+Roles are not assigned directly to users or service accounts. Group membership is the sole route to permissions: groups hold role assignments, and a principal's effective authority is the union of all roles held by all groups they belong to. A caller may only assign roles that contain permissions the caller already holds — privilege escalation through role assignment is not permitted.
 
 The ACL endpoint returns the union of all role scopes for a principal. Every service calls this endpoint to authorise operations — there is no local policy evaluation.
 
@@ -481,10 +484,8 @@ Quota allocation uses a two-phase reservation model. The handler makes a soft re
 
 - **On resource create**: the handler computes the reservation key via `GenerateResourceReference` and checks whether available quota (limit minus committed allocations minus active reservations) is sufficient. If insufficient, the handler returns `403 Forbidden` immediately. If sufficient, the handler creates a soft reservation keyed on the resource UUID before returning `202`. The reservation reduces the available balance immediately, preventing concurrent requests from racing past the quota limit.
 - **The controller** promotes the reservation to a committed allocation on the provisioning path. Promotion is idempotent on the key.
-- **The controller** releases the committed allocation on the deprovisioning path, before removing its finalizer. Release is idempotent on the key.
-- If the resource is deleted before the controller has promoted the reservation, the controller detects the tombstone, releases the reservation rather than a committed allocation, and removes its finalizer. The quota balance is restored correctly regardless of which phase the lifecycle was in.
-- Reservations carry a long TTL sufficient to encompass any realistic provisioning duration. The TTL is a safety net for leaked reservations only — it is not a normal operational path.
-- If a reservation has expired before the controller runs, the controller attempts a fresh allocation against the current balance. If quota is now exhausted, the controller sets `ConditionReasonErrored`.
+- **The controller** releases the reservation or committed allocation (whichever is current) on the deprovisioning path, before removing its finalizer. Release is idempotent on the key.
+- The handler adds the controller's finalizer to the resource at creation time, before returning `202` (see [section 7.2](#72-handler-layer-responsibilities)). This guarantees the deprovisioning path always runs before the resource is garbage collected, even if deletion is requested before the controller's first reconcile. Any external resource, reservation, or side effect created during handler execution — quota reservations, cross-service resources, index entries — is cleaned up unconditionally by the deprovisioning path. No special handling is required for deletion arriving before the controller has run.
 - The quota system must treat all allocation, promotion, and release operations as idempotent on the key.
 - The quota service must provide atomic check-and-reserve. The available balance check and the reservation creation must be a single atomic operation.
 
@@ -684,11 +685,11 @@ The platform enforces three tiers of access control, each with a distinct authen
 
 | Tier | Principals | Authentication |
 |---|---|---|
-| Public | End users and tooling | OIDC tokens. Access only via service REST APIs. |
-| Service | Platform services | mTLS exclusively. Certificate CN maps to RBAC role. |
-| Platform | Cloud provider APIs | Accessed only by the Region service via Kubernetes Secret credentials. |
+| Public | End users, service accounts, and tooling | OIDC tokens. Access only via service REST APIs. |
+| System | Platform services (system accounts) | mTLS exclusively. Certificate CN maps to RBAC role. |
+| Platform | Cloud provider APIs | Accessed only by the Region service via stored credentials. |
 
-RBAC as defined in [section 4.3](#43-rbac) is the enforcement mechanism for Public and Service tier access. No principal in any tier may access resources outside their permitted scope as defined by the ACL.
+RBAC as defined in [section 4.3](#43-rbac) is the enforcement mechanism for Public and System tier access. No principal in any tier may access resources outside their permitted scope as defined by the ACL.
 
 ### 10.1 Platform Security Invariants
 
@@ -715,9 +716,9 @@ The core library is not a deployed service. It is a shared Go library that provi
 | Term | Definition |
 |---|---|
 | ACL | Computed set of endpoint scopes and CRUD permissions for a principal |
-| CloudIdentity | Cloud project/user/role provisioned by the Region service for a consuming service |
 | ClusterManager | Isolated Cluster API instance; multi-tenant cluster lifecycle management |
 | CN | X.509 Common Name — service identity for mTLS; maps to an RBAC role |
+| ComputeInstance | User-visible resource owned by the Compute service; realised via a hidden Region Server |
 | CRD | Custom Resource Definition — Kubernetes extension for all platform resource types |
 | DAG | Directed Acyclic Graph — structure of resource containment and access scope hierarchy |
 | Data Boundary | Each service exclusively owns its data; others access only via versioned API |
@@ -725,11 +726,12 @@ The core library is not a deployed service. It is a shared Go library that provi
 | DRAINING | Deletion state: references cleared, cleaning owned children |
 | FINALIZING | Deletion state: children gone, releasing references on parent resources |
 | DELETED | Deletion state: all references released, resource garbage collected |
-| `infra-manager-service` | RBAC role: read on regions, read/delete on identities and physicalnetworks |
+| Group | Organisation-scoped collection of users and service accounts; the primary route to RBAC role assignment |
+| Identity (Region) | Cloud project/user/credentials provisioned by the Region service for a consuming service |
 | mTLS | Mutual TLS — both sides present certificates; all service-to-service auth |
 | OIDC | OpenID Connect — end-user authentication protocol |
 | Containment Edge | Edge carrying scope propagation and forward deletion propagation; resource cannot exist outside the scope of its container |
-| Principal | Originating end-user responsible for a resource; determines quota and billing |
+| Principal | Originating end-user or service account responsible for a resource; determines quota and billing |
 | Consumption Edge | Edge carrying reverse deletion propagation (blocking) and co-location; resource uses another it does not contain |
 | Dependency Edge | Edge carrying reverse deletion propagation (triggering) and co-location; deletion of target triggers deletion of source |
 | `ErrYield` | Sentinel error signalling expected transient blocking; triggers fixed-period requeue, not exponential backoff |
@@ -738,7 +740,10 @@ The core library is not a deployed service. It is a shared Go library that provi
 | Proxy | A service acting on behalf of a principal to provision resources |
 | Reference | Named dependency claim on a resource; blocks deletion until removed |
 | Region | A registered cloud provider instance |
+| ServiceAccount | Organisation-bound non-human identity managed by the Identity service; authenticated via bearer token; authority derived from group membership |
+| SigningKey | Identity service resource holding the active and previous JWT signing key pair; governs token issuance and rolling verification |
 | Status Propagation | Edge property: state change on the target enqueues the source for reconciliation; source re-derives its own status from aggregate state of connected targets |
+| System Account | A platform service identity, authenticated exclusively via mTLS; certificate CN maps to an RBAC role |
 | Core Library | Shared Go library of canonical platform patterns; the reference implementation of all platform design patterns |
 | `GenerateResourceReference` | Core library function producing a deterministic reference string: `{resource}.{group}/{uuid}`. The canonical key for allocations and resource references. |
 | UUID v4 | Randomly generated universally unique identifier. Standard format for all resource names on the platform. |
