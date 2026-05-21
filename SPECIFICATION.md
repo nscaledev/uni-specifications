@@ -447,7 +447,9 @@ Deletion proceeds through three internal reconciler phases. These are not distin
 
 ### 6.1 Naming and Metadata
 
-- Resource identifiers are UUID v4 (random), generated at creation time. They are globally unique and immutable for the lifetime of the resource. A resource ID is never reused, reassigned, or modified. UUID v5 (deterministic) is used only for index resources whose sole purpose is uniqueness enforcement — never for resources carrying billing, quota, or audit identity. See [Appendix A.1](#a1-toctou-race--resource-name-uniqueness).
+- Resource identifiers are UUIDs, globally unique and immutable for the lifetime of the resource. A resource ID is never reused, reassigned, or modified. Two strategies exist — the choice is architectural, not cosmetic (see [Appendix A.1](#a1-toctou-race--resource-name-uniqueness)):
+  - **UUID v4 (random)** — default for all resources. Use `GenerateResourceID` / `NewObjectMetadata`. The platform is the sole authority on the name; no natural key exists. Each lifetime of the resource gets a distinct UUID, keeping billing and audit records unambiguous across recreations.
+  - **UUID v5 (deterministic)** — use when the resource participates in a uniqueness contract derived from immutable content fields (e.g. network-id + hostname). Use `GenerateDeterministicResourceID` / `NewDeterministicObjectMetadata`. Two creates with the same natural key produce the same UUID and collide at the storage layer, giving native 409 conflict detection without a read-before-write. Trade-off: if the resource is deleted and recreated with the same natural key, it gets the same UUID — billing and audit records from a previous lifetime share the identifier with the new resource.
 - Human-readable names are stored in `metadata.labels[<platform-label-prefix>/name]` and are mutable. Never hardcode resource names.
 - Resource status is expressed exclusively via `status.conditions`, following the `metav1.Condition` schema with strongly-typed reason constants. There is no authoritative phase field — conditions are the sole source of truth for resource state.
 - Operations that require a controller to drive the resource to its terminal state are asynchronous and return `202 Accepted` immediately. Operations that are fully effected within the request/response cycle are synchronous: reads return `200 OK`, creates return `201 Created`. Always read `status.conditions` before acting on resource state. See [§7.1](#71-synchronous-vs-asynchronous-operations) for the normative definition.
@@ -893,12 +895,12 @@ The core library is not a deployed service. It is a shared Go library that provi
 | `pkg/messaging` | Event bus publisher and consumer. Use for all cross-service deletion and status propagation. Do not subscribe to another service's storage directly. |
 | `pkg/options` | Process bootstrap: namespace, logging (zap + controller-runtime), OpenTelemetry (tracer, meter, OTLP export). All services use this as their startup base. |
 | `pkg/provisioners` | The `Provisioner` interface and `ErrYield`. Combinators: `serial` (ordered, stop on first yield), `concurrent` (parallel, independent children), `conditional` (provision or actively deprovision based on a predicate). Use combinators to compose complex provisioning logic rather than writing ad hoc orchestration. |
-| `pkg/server/conversion` | `NewObjectMetadata` (create path) and `UpdateObjectMetadata` (update path) for constructing and mutating platform-standard resource metadata. Status mapping: deletion takes precedence over provisioning state. Tag conversion between Kubernetes and OpenAPI representations. |
+| `pkg/server/conversion` | `NewObjectMetadata` (create path, random UUID v4) and `NewDeterministicObjectMetadata` (create path, UUID v5 from caller-supplied namespace UUID and invariant string) for constructing platform-standard resource metadata. `UpdateObjectMetadata` for mutation on update. Status mapping: deletion takes precedence over provisioning state. Tag conversion between Kubernetes and OpenAPI representations. |
 | `pkg/server/errors` | Canonical error constructors: `HTTPNotFound`, `HTTPConflict`, `AccessDenied`, `OAuth2InvalidRequest`. `HandleError` normalises arbitrary failures to the platform error contract. `PropagateError` adapts generated OpenAPI client error responses. Never construct error responses manually. |
 | `pkg/server/middleware` | Pre-routing middleware components: OpenTelemetry, logging, route resolver, CORS, timeout. These are the components assembled in §7.2.2. |
 | `identity/pkg/middleware/audit` | `audit.Middleware` — post-routing middleware that emits structured audit log entries. Lives in the Identity service, not core, because audit logging depends on identity-specific principal and ACL context. Import from `github.com/unikorn-cloud/identity/pkg/middleware/audit`. |
 | `pkg/server/saga` | Synchronous in-process saga coordinator. Best-effort rollback on failure. Use for any handler that produces side effects across multiple systems. |
-| `pkg/util` | `GenerateResourceID` — Kubernetes-safe random UUID v4. `ServiceDescriptor` — service name/version/revision for identity in logs and telemetry. |
+| `pkg/util` | `GenerateResourceID` — Kubernetes-safe random UUID v4. `GenerateDeterministicResourceID(idNamespace, invariant)` — Kubernetes-safe UUID v5 derived from a caller-supplied namespace UUID and invariant string; each resource type must use its own fixed namespace UUID constant to prevent cross-type collisions. `ServiceDescriptor` — service name/version/revision for identity in logs and telemetry. |
 
 ---
 
@@ -942,7 +944,7 @@ The core library is not a deployed service. It is a shared Go library that provi
 | Core Library | Shared Go library of canonical platform patterns; the reference implementation of all platform design patterns |
 | `GenerateResourceReference` | Core library function producing a deterministic reference string: `{resource}.{group}/{uuid}`. The canonical key for allocations and resource references. |
 | UUID v4 | Randomly generated universally unique identifier. Standard format for all resource names on the platform. |
-| UUID v5 | Deterministically generated UUID (RFC 4122). Used only for index resources whose sole purpose is uniqueness enforcement. Never used for resources carrying billing, quota, or audit identity. See Appendix A.1. |
+| UUID v5 | Deterministically generated UUID (RFC 4122). Used when a resource has a natural uniqueness key — either as the resource's own name (`GenerateDeterministicResourceID`) or as the name of a uniqueness-index CRD. See Appendix A.1 for the two approaches and when to choose each. |
 | `unikorn-client-issuer` | Root CA for all inter-service mTLS |
 | Delegated Principal | A user principal propagated by a proxy service across an internal API boundary. The transport is mTLS; the actor for RBAC, quota, billing, and audit is the user, not the proxy. See [section 4.5.1](#451-api-authentication-classifications). |
 | `x-hidden: true` | OpenAPI operation extension that suppresses an endpoint from public documentation (Mintlify). Documentation marker only — no middleware enforcement effect. |
@@ -953,21 +955,25 @@ The core library is not a deployed service. It is a shared Go library that provi
 
 ### A.1 TOCTOU Race — Resource Name Uniqueness
 
-**Fix** (applies to all services with per-network hostname uniqueness constraints)
+Resources with a natural uniqueness key (e.g. hostname on a virtual network) must not use list-then-check for duplicate detection — the window between the read and the write is a race. Two approaches exist; the choice depends on whether the resource's UUID needs to be stable or fresh across recreations.
 
-Introduce a `HostnameIndex` CRD per service (e.g. `ServerHostnameIndex` in `uni-region`, `InstanceHostnameIndex` in `uni-compute`). Its sole purpose is to hold a uniqueness slot — it is a mutex, not a managed resource, and carries no billing or identity significance.
+**Approach A — Deterministic resource ID** (`NewDeterministicObjectMetadata`)
 
-The index resource name is derived as UUID v5, seeded from a fixed platform namespace UUID constant (defined in the core library) and the string `networkID+"/"+hostname`. Two concurrent creates with the same inputs produce the same UUID v5 and collide natively at the storage layer. One receives a native `409`. No application-level race detection is required.
+The resource itself is given a UUID v5 name derived from its natural key (e.g. `(networkID, hostname)`). Two concurrent creates with the same natural key produce the same UUID and collide natively at the storage layer — one receives a `409`, no application-level race detection required. No separate index resource is needed.
 
-The resource name (Server, ComputeInstance, etc.) remains UUID v4 — random, unique across all lifetimes, unambiguous for billing, quota, and audit.
+Trade-off: if the resource is deleted and recreated with the same natural key, it gets the same UUID. Billing and audit records from the previous lifetime share the identifier with the new resource.
 
-The index entry is created before the resource. If index creation returns `409`, the handler returns `409` to the caller and no resource is created. If resource creation subsequently fails, the saga compensating transaction deletes the index entry.
+Each resource type must define its own fixed namespace UUID constant to prevent cross-type collisions. The invariant must be composed of stable, immutable fields.
 
-The resource is set as the Kubernetes owner of its index entry at create time. When the resource is deleted, Kubernetes garbage collects the index entry automatically via owner references.
+**Approach B — UUID v5 index resource** (original fix)
 
-When the index entry is garbage collected, the UUID v5 slot is free. A new resource with the same hostname on the same network gets a fresh UUID v4 and creates a new index entry under the same UUID v5 name. Previous billing and audit records point at the old UUID v4 — unambiguous, no collision across lifetimes.
+Introduce a `HostnameIndex` CRD whose sole purpose is holding a uniqueness slot. Its name is UUID v5 of the natural key; the main resource retains a random UUID v4. The index entry is created first (in a saga); a `409` on index creation returns `409` to the caller. The resource is set as Kubernetes owner of its index entry so GC handles cleanup.
 
-`isServerNameInUse()`, `isInstanceNameInUse()`, and any equivalent list-then-check functions become redundant and must be deleted.
+Trade-off: more moving parts (extra CRD, owner reference, saga step), but the main resource gets a fresh UUID v4 on each creation — unambiguous billing and audit records across lifetimes.
+
+**Choosing between approaches:** prefer Approach A for new work — simpler, fewer CRDs, no saga dependency. Use Approach B only when UUID stability across recreations would cause a correctness problem (e.g. billing systems that key records on resource UUID and cannot tolerate reuse).
+
+`isServerNameInUse()`, `isInstanceNameInUse()`, and any equivalent list-then-check functions are redundant under either approach and must be deleted.
 
 ### A.2 Pagination — Known Deficiency
 
@@ -1046,7 +1052,7 @@ Use this checklist when introducing a new service to the platform. Each item map
 - [ ] ACL-restricted or scoped-visibility resources return `404` for both non-existence and access denial — never `403` ([§7.9](#79-error-handling-and-propagation))
 - [ ] No caching of caller-scoped (impersonated, RBAC-filtered) responses in downstream consumers ([§10.1](#101-platform-security-invariants))
 - [ ] Multi-step creates use a saga with compensating transactions for each side-effectful step ([§7.5](#75-multi-step-operations-sagas))
-- [ ] Per-network uniqueness enforced via UUID v5 index resource, not list-then-check ([Appendix A.1](#a1-toctou-race--resource-name-uniqueness))
+- [ ] Per-network uniqueness enforced via deterministic resource ID or UUID v5 index resource — not list-then-check ([Appendix A.1](#a1-toctou-race--resource-name-uniqueness))
 - [ ] Error responses constructed via core library helpers only; never manually constructed ([§7.9](#79-error-handling-and-propagation))
 
 **RBAC and Security**
