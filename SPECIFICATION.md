@@ -25,7 +25,7 @@ Nscale Cloud Platform Engineering
    - [4.5 Principal Propagation](#45-principal-propagation)
      - [4.5.1 API Authentication Classifications](#451-api-authentication-classifications)
    - [4.6 Principal Propagation Modes and Impersonation](#46-principal-propagation-modes-and-impersonation)
-     - [4.6.1 ACL Intersection under Impersonation](#acl-intersection-under-impersonation)
+     - [4.6.1 ACL Intersection under Impersonation](#461-acl-intersection-under-impersonation)
    - [4.7 Federated Authentication](#47-federated-authentication)
    - [4.8 Token Infrastructure](#48-token-infrastructure)
 5. [Resource Graph](#5-resource-graph)
@@ -193,7 +193,7 @@ RBAC roles are composed of endpoint scopes, each with a CRUD permission set. Rol
 
 Roles are not assigned directly to users or service accounts. Group membership is the sole route to permissions: groups hold role assignments, and a principal's effective authority is the union of all roles held by all groups they belong to. A caller may only assign roles that contain permissions the caller already holds — privilege escalation through role assignment is not permitted.
 
-The ACL endpoint returns the union of all role scopes for a principal. Every service calls this endpoint to authorise operations — there is no local policy evaluation.
+The identity service exposes an ACL endpoint that returns the union of all role scopes for a principal. Every service enforces RBAC against this data — there is no local policy evaluation. Service code must not call this endpoint directly; it is accessed exclusively through the RBAC middleware library (`identity/pkg/rbac`, import path `github.com/unikorn-cloud/identity/pkg/rbac`), which handles token introspection, ACL retrieval, and scope enforcement as a unit. From the perspective of a handler author, RBAC is opaque: call the correct library check at the correct point in the handler and the middleware provides the rest.
 
 Protected roles (`protected: true`) are not visible via the public API and may only be granted via Helm values at deployment time. These roles gate privileged platform operations.
 
@@ -229,13 +229,13 @@ A proxy may provision resources in its own tenancy or in the principal's tenancy
 
 #### 4.5.1 API Authentication Classifications
 
-Every API endpoint falls into exactly one of three authentication classifications:
+Every API endpoint falls into one of two visibility classifications, expressed via OpenAPI annotations. These annotations have no enforcement effect — access control is governed exclusively by RBAC policies:
 
-**Public** — OAuth2 bearer token required. The principal is derived at the boundary from token introspection. The endpoint is reachable by authenticated tenants. No mTLS client certificate is required from the caller. RBAC is enforced against the derived user principal. OpenAPI annotation: no extension required (this is the default).
+**Public** — reachable by authenticated tenants via OAuth2 bearer token. The principal is derived from token introspection and RBAC is enforced against it. OpenAPI annotation: none (this is the default).
 
-**Internal (service principal)** — mTLS client certificate required, no bearer token accepted. The calling service certificate CN is the actor. No user principal is present or expected. RBAC is enforced against the service identity. Used for purely platform-initiated operations with no user context. OpenAPI annotation: `x-internal: true`.
+**Internal** — intended for service-to-service calls only. Suppressed from public API documentation via `x-hidden: true`. Access is restricted by RBAC policy (services authenticate via mTLS; only roles granted to system account CNs have access). No schema-level enforcement exists — `x-hidden: true` is a documentation marker, not a security control.
 
-**Internal (delegated principal)** — mTLS client certificate required, no bearer token accepted. A user principal must be propagated in the request context by the calling service. The mTLS CN identifies the authorised relay — the service trusted to carry the principal — but is not the actor for RBAC or audit. RBAC is enforced against the propagated user principal. Quota, billing, and audit are attributed to the user. OpenAPI annotation: `x-internal: true`, `x-principal: delegated`.
+For internal endpoints, handler code determines how to use the caller's identity: against the mTLS CN alone (service principal, no user context), or against a user principal propagated in `X-Principal` (delegated principal). See §4.6 for the full principal handling rules.
 
 ### 4.6 Principal Propagation Modes and Impersonation
 
@@ -243,7 +243,7 @@ A user principal (`X-Principal`) may be propagated on any authenticated service-
 
 **Attribution-only propagation** — `X-Principal` is present; `X-Impersonate` is absent or false. The receiving service records the principal for billing, quota, and audit attribution only. It does not resolve RBAC against the propagated principal. Access decisions are made against the calling service's own mTLS certificate identity. This is the required mode for controllers provisioning resources on behalf of a user, where authorisation was established at the public API boundary and does not need to be re-evaluated on every downstream call.
 
-**Impersonation** — `X-Principal` is present and `X-Impersonate: true` is also set. The receiving service treats the propagated principal as the authoritative actor for RBAC, quota, billing, and audit on that request. The effective ACL is the intersection of the user's ACL and the impersonating service's own system account ACL (see [ACL Intersection under Impersonation](#acl-intersection-under-impersonation) below). This mode is only appropriate for proxy services presenting a user's identity downstream so that the full access control chain is preserved end-to-end.
+**Impersonation** — `X-Principal` is present and `X-Impersonate: true` is also set. The receiving service treats the propagated principal as the authoritative actor for RBAC, quota, billing, and audit on that request. The effective ACL is the intersection of the user's ACL and the impersonating service's own system account ACL (see [§4.6.1](#461-acl-intersection-under-impersonation) below). This mode is only appropriate for proxy services presenting a user's identity downstream so that the full access control chain is preserved end-to-end.
 
 **Rules:**
 
@@ -252,9 +252,9 @@ A user principal (`X-Principal`) may be propagated on any authenticated service-
 - In attribution-only mode, the receiving service resolves RBAC against the calling service's mTLS certificate identity.
 - Impersonation (`X-Impersonate: true`) is only appropriate for proxy services. It is not a general-purpose capability.
 - A service must never impersonate another service's identity. The mTLS certificate CN is fixed. Only the user principal context may travel in `X-Principal`.
-- Any service holding a valid platform CA-signed mTLS certificate is trusted to signal impersonation. No additional allowlist of permitted impersonators is maintained. The mTLS trust boundary is the sole control.
+- Every registered system service may signal impersonation — the impersonation gate is the same CN→role registration described in §4.3; no separate allowlist exists. However, impersonation only activates when a valid user principal is present in the request context (`X-Principal` header with a non-empty actor). Without a principal to synthesise RBAC against, the `X-Impersonate` header is ignored and the service's own mTLS identity is used for access decisions.
 
-#### ACL Intersection under Impersonation
+#### 4.6.1 ACL Intersection under Impersonation
 
 When a system account (mTLS-authenticated service) impersonates an end-user, returning the user's ACL in full creates a confused deputy vulnerability: a user may hold permissions that the impersonating service itself is not authorised to exercise, and a narrowly-scoped proxy service could inadvertently acquire the user's broader administrative rights against the downstream service.
 
@@ -324,7 +324,7 @@ The three common relationship patterns in the platform are each a distinct inter
 
 | Edge Type | Properties | Example |
 |---|---|---|
-| Containment | Scope Propagation + Forward Deletion Propagation (opt-in) + Status Propagation Upward (where applicable) + Co-location (implicit) | Organisation → Project; Cluster → Server |
+| Containment | Scope Propagation + Reverse Deletion Propagation (blocking) + Forward Deletion Propagation (opt-in) + Status Propagation Upward (where applicable) + Co-location (implicit) | Organisation → Project; Cluster → Server |
 | Consumption | Reverse Deletion Propagation (blocking) + Status Propagation Upward (where applicable) + Co-location Required | Server → Network |
 | Dependency | Reverse Deletion Propagation (triggering) + Status Propagation Upward (where applicable) + Co-location Required | Cluster → Network |
 
@@ -334,14 +334,11 @@ A new resource type that does not fit these three patterns is expressed by decla
 
 All edge relationships are expressed as named references on the target resource. A reference blocks deletion of the resource it is placed on. A resource in DELETING state blocks until all references are removed. References do not lapse automatically.
 
-References may cross service boundaries and are managed via the reference API. Reference operations are idempotent:
+**Implementation mechanism.** References are implemented as Kubernetes finalizers on the referenced (target) resource. Placing a reference adds a finalizer to the target's `metadata.finalizers`; releasing a reference removes it. This means the Kubernetes API server enforces deletion blocking natively — a resource with outstanding finalizers cannot be garbage collected regardless of whether a controller is running. The reference API provides a service-boundary-safe interface for managing these finalizers across services.
 
-```
-PUT    /api/v1/{resource}/references/{name}  →  200 OK
-DELETE /api/v1/{resource}/references/{name}  →  200 OK
-```
+References may cross service boundaries and are managed via the reference API. Reference operations are idempotent (both `PUT` to add and `DELETE` to remove return `200 OK`). The exact path structure is service-specific — v1 services include organisation and project in the path; v2 services address resources directly by UUID. Consult the target service's OpenAPI spec for the concrete endpoint.
 
-The canonical reference string is derived by `GenerateResourceReference`: `{resource}.{group}/{uuid}`. This is deterministic, stable for the lifetime of the consuming resource, and unique across all resource types and groups. No other format is permitted for cross-resource references.
+The canonical reference string is derived by `GenerateResourceReference`: `{resource}.{group}/{uuid}`. This is stable for the lifetime of the target resource and unique across all resource types and groups. No other format is permitted for cross-resource references.
 
 Adding a reference is idempotent — if already present the operation is a no-op. Removing a reference is idempotent — if absent the operation is a no-op. Both operations use optimistic locking; a write conflict is a transient condition and must be silently retried (see [section 8.2](#82-transient-conditions-and-silent-retry)).
 
@@ -355,7 +352,7 @@ Two valid reference lifecycle patterns exist:
 
 ### 5.4 Event Bus
 
-The event bus is a push-based messaging system through which services publish resource lifecycle events and subscribe to events from services they depend on. Its current implementation is Kubernetes list/watch, but it is designed for replacement with a scalable enterprise offering (e.g. Confluent) without changing the event semantics.
+The event bus is a push-based messaging system through which services publish resource lifecycle events and subscribe to events from services they depend on. The abstraction is backend-agnostic: the current implementation uses Kubernetes list/watch, and the interface is designed so the backend can be replaced (e.g. with Kafka or NATS) without changing consumer code or event semantics.
 
 - On service start or restart, all existing resources on the subscribed topic must be replayed. This allows subscribers to trigger or re-evaluate any deletion that was missed during downtime. All subsequent events are streamed.
 - Event delivery is at-least-once. Subscribers must handle duplicate events idempotently. Exactly-once delivery is not guaranteed and must not be assumed.
@@ -368,6 +365,8 @@ The event bus is a push-based messaging system through which services publish re
 ### 5.5 Containment
 
 A containment edge expresses that a resource cannot exist outside the scope of its container. The contained resource's existence is logically bounded by the container. Example: an Organisation contains a Project; a Project contains a Server (via transitive closure).
+
+The "cannot exist outside" invariant is enforced by the reverse deletion propagation (blocking) property that containment edges carry by default: contained resources place blocking references on their container, so the container cannot be deleted while any contained resource exists. Forward deletion propagation (opt-in) is the automation that cascades deletion from container to contained resources. Without it, contained resources must be manually deleted before the container can be removed — the blocking references prevent the container from disappearing first.
 
 - Containment is transitive. A resource reachable from a given node via a chain of containment edges is part of that node's subtree, regardless of how many hops separate them.
 - Containment edges span service boundaries. No single service owns the full containment graph.
@@ -428,12 +427,14 @@ Adding a new resource type to the graph is a formal exercise. For each relations
 
 ### 5.12 Deletion State Machine
 
-| State | Description |
+Deletion proceeds through three internal reconciler phases. These are not distinct API-visible condition states — the API-visible condition reason throughout DELETING, DRAINING, and FINALIZING is `ConditionReasonDeprovisioning`. `ConditionReasonDeprovisioned` is set immediately before the controller's own finalizer is removed — as the last status write the controller will ever make to the resource. Kubernetes garbage collects the object after the finalizer is gone.
+
+| Phase | Description |
 |---|---|
-| DELETING | Resource tombstoned. Deletion event published. Blocks while any inbound references exist. |
-| DRAINING | All inbound references removed. Cleaning up contained child resources. |
-| FINALIZING | Contained children gone. Releasing outbound references held on consumed or depended-on resources. |
-| DELETED | All references released. Resource garbage collected. |
+| DELETING | `DeletionTimestamp` set on the Kubernetes object. Deletion event published. Reconciler blocks while any inbound reference finalizers exist (see [§5.3](#53-references)). |
+| DRAINING | All reference finalizers cleared — every holder has released its claim. Reconciler cleans up contained child resources. |
+| FINALIZING | Contained children gone. Reconciler releases outbound references held on consumed or depended-on resources, then removes its own finalizer. |
+| DELETED | Reconciler sets `ConditionReasonDeprovisioned`, then removes its own finalizer as the last action. Kubernetes garbage collects the object after the finalizer is gone. |
 
 ### 5.13 Deletion Events
 
@@ -449,7 +450,7 @@ Adding a new resource type to the graph is a formal exercise. For each relations
 - Resource identifiers are UUID v4 (random), generated at creation time. They are globally unique and immutable for the lifetime of the resource. A resource ID is never reused, reassigned, or modified. UUID v5 (deterministic) is used only for index resources whose sole purpose is uniqueness enforcement — never for resources carrying billing, quota, or audit identity. See [Appendix A.1](#a1-toctou-race--resource-name-uniqueness).
 - Human-readable names are stored in `metadata.labels[<platform-label-prefix>/name]` and are mutable. Never hardcode resource names.
 - Resource status is expressed exclusively via `status.conditions`, following the `metav1.Condition` schema with strongly-typed reason constants. There is no authoritative phase field — conditions are the sole source of truth for resource state.
-- Resource provisioning operations (create, update, delete) are asynchronous — they return `202 Accepted` immediately and a controller drives them to completion. Reference operations and reads are synchronous. Always read `status.conditions` before acting on resource state.
+- Operations that require a controller to drive the resource to its terminal state are asynchronous and return `202 Accepted` immediately. Operations that are fully effected within the request/response cycle are synchronous: reads return `200 OK`, creates return `201 Created`. Always read `status.conditions` before acting on resource state. See [§7.1](#71-synchronous-vs-asynchronous-operations) for the normative definition.
 
 ### 6.2 Labels and Annotations
 
@@ -476,9 +477,9 @@ Tags are user-defined key-value pairs attached to resources via `spec.tags`. The
 
 Tags are used for user-defined resource organisation — cost attribution, environment markers, team ownership. They are applied as a post-list filter in-process after storage retrieval; they are not expressed as storage-level selectors. This means tag filtering does not reduce the storage query cost and cannot be used as a substitute for scope labels.
 
-**Platform-reserved tag keys.** The platform currently uses reserved tag keys within service-owned namespaces (e.g. `compute.unikorn-cloud.org/instance-id`) for internal resource linkage — for example, to recover the backing `region.Server` for a `ComputeInstance` without storing an explicit foreign key. These reserved keys are managed exclusively by the platform, must not be set by users or agents, and are stripped from user-supplied payloads before being re-applied by the platform.
+**Platform-reserved tag keys.** The platform currently uses reserved tag keys within service-owned namespaces (e.g. `compute.unikorn-cloud.org:instance-id`) for internal resource linkage — for example, to recover the backing `region.Server` for a `ComputeInstance` without storing an explicit foreign key. These reserved keys are managed exclusively by the platform, must not be set by users or agents, and are stripped from user-supplied payloads before being re-applied by the platform.
 
-**Intended direction.** The use of tags for internal linkage is a transitional pattern. `spec.tags` should converge to being exclusively user-facing: values that are opaque to the platform and used only for user-defined resource organisation. Internal resource linkage should move to explicit labels (§6.2) or stored spec fields. Any new service that needs internal resource coordination must use labels or explicit spec fields — not tags.
+**Intended direction.** The use of tags for internal linkage is a transitional pattern. `spec.tags` should converge to being exclusively user-facing: values that are opaque to the platform and used only for user-defined resource organisation. Internal resource linkage should move to explicit labels (§6.2) or stored spec fields. New services should not use tags for internal resource coordination — prefer labels or explicit spec fields.
 
 ---
 
@@ -523,9 +524,8 @@ The distinction between synchronous and asynchronous operations reflects whether
 
 Every handler must declare its authentication classification via OpenAPI extensions on the operation or path. The classification must match [section 4.5.1](#451-api-authentication-classifications) exactly.
 
-- **Public handlers** (default, no extension): middleware derives the principal from the OAuth2 bearer token. The handler calls `rbac.AllowProjectScope` or `rbac.AllowOrganizationScope` against it.
-- **Internal (service principal) handlers** (`x-internal: true`): middleware verifies the mTLS CN against the allowed caller list. No bearer token is accepted. No user principal is present in context.
-- **Internal (delegated principal) handlers** (`x-internal: true`, `x-principal: delegated`): middleware verifies the mTLS CN and asserts that a user principal is present in the request context. The handler calls `rbac.AllowProjectScope` or `rbac.AllowOrganizationScope` against the propagated user principal.
+- **Public handlers** (no annotation): principal derived from OAuth2 bearer token via token introspection. The handler calls `rbac.AllowProjectScope` or `rbac.AllowOrganizationScope` against the derived principal.
+- **Internal handlers** (`x-hidden: true`): access restricted by RBAC policy (mTLS service accounts). The annotation is documentation-only. The handler inspects the request at runtime: if `X-Principal` is absent, RBAC is resolved against the mTLS CN; if `X-Principal` is present, RBAC is resolved against the propagated user principal. See §4.6 for principal handling modes.
 
 #### 7.2.2 Server Middleware Stack
 
@@ -600,7 +600,7 @@ Quota allocation uses a two-phase reservation model. The handler makes a soft re
 - Public-facing APIs must be backward compatible within a version. Additive changes — new optional fields, new endpoints, new enum values — are permitted without a version bump. Removing fields, changing field semantics, or altering response structure requires a version bump.
 - A deprecated version must remain available for a defined deprecation period before removal. Deprecation must be communicated via API response headers and documented in the changelog.
 - Inter-service APIs may be broken deliberately, provided the producing service and all consuming services are updated in the same coordinated release. No deprecation period is required.
-- Major version bumps — paradigm shifts rather than incremental changes — should be coordinated across all services simultaneously. The v2 release is the canonical example of a coordinated major bump.
+- Major version bumps — paradigm shifts rather than incremental changes — must be coordinated across all services simultaneously. Partial major version rollouts that leave consumers on the old version are not supported. The v2 release is the canonical example of a coordinated major bump.
 
 ### 7.8 List Filtering
 
@@ -637,7 +637,7 @@ Every error response body carries: `error` (machine-readable code), `error_descr
 - Where revealing that a resource exists would constitute a data boundary violation, or where the resource has scoped visibility (ACL-restricted, impersonation-filtered), return `404` uniformly regardless of whether the actual cause is non-existence or forbidden access. Never use `403` as an existence oracle. Phrasing such as "resource does not exist or is not accessible" is equally prohibited — distinguishing the two cases leaks existence information. (OWASP WSTG-ERRH-01, CWE-208)
 - Authentication error responses must not distinguish between an unknown principal and an incorrect credential. Both return `401 access_denied` with a non-specific description. (OWASP WSTG-ERRH-02)
 - Error descriptions must never reference resources, identifiers, or state belonging to a scope the requesting principal cannot access.
-- When a handler calls a downstream service and receives an error response, it must propagate the typed error faithfully. A `403` from downstream propagates as `403` to the end user.
+- When a handler calls a downstream service and receives an error response, it must propagate the typed error faithfully — with one exception: if the downstream returns `403` for a resource that would constitute an existence-oracle violation at this service's data boundary (i.e. the requesting user should not know the resource exists), map the `403` to `404`. Internal service-to-service `403` responses caused by mTLS misconfiguration propagate as `403` since they are not existence-oracle issues.
 - Untyped errors are caught by the terminal error handler and written as `500 server_error` with no detail.
 - The `401` response includes a `WWW-Authenticate` header per RFC6750 and RFC9728. Services must not construct this header manually — use the canonical `AccessDenied` constructor from the core library.
 
@@ -647,7 +647,7 @@ The v2 API is the target design for all platform services. New services must fol
 
 **Flat routing.** v1 APIs embedded organisation and project in the URL path, coupling the routing structure to the tenancy hierarchy. This made cross-project resource references awkward and produced deeply nested paths. v2 routes resources directly by their UUID. Organisation and project context is not required in the URL — it is inferred from the resource itself, from a field in the request body, or from a related resource resolved during the request.
 
-**Relationship-driven scoping.** In v1, list operations traversed the URL hierarchy to determine scope. In v2, list operations begin with a label selector that encodes the relevant constraints (organisation, project, region, network, etc.), then apply RBAC filtering per item. Scope is a property of the resource, expressed through its labels, not a property of the path.
+**Relationship-driven scoping.** In v1, list operations traversed the URL hierarchy to determine scope. In v2, list operations are bounded by the principal's ACL and optionally narrowed further by caller-supplied query parameters (e.g. organisation ID, project ID, region ID). The server constructs a label selector from the ACL and any supplied query parameters, then applies per-item RBAC filtering. Scope is a property of the resource, expressed through its labels, not a property of the path.
 
 **Direct resource addressing.** Resources are addressed by their UUID in all operations. There is no hierarchical path traversal to reach a resource. A handler resolves scope by reading the resource and walking its label-encoded ancestry, not by interpreting the URL structure.
 
@@ -662,29 +662,24 @@ The OpenAPI specification is the source of truth for every service API. All serv
 **When building a new service, the OpenAPI spec is the first artefact to write.** Before any Go code is authored:
 
 1. Define all resource types, request/response schemas, and endpoint paths in the OpenAPI YAML.
-2. Annotate each operation with the correct authentication classification: default (public), `x-internal: true` (service principal), or `x-internal: true` + `x-principal: delegated` (delegated principal). These annotations drive middleware behaviour directly — incorrect annotations produce incorrect enforcement.
+2. Annotate each operation with the correct visibility classification: no annotation (public) or `x-hidden: true` (internal). For internal endpoints that expect a propagated user principal, document this in the endpoint description — it is a handler-code contract, not a middleware concern.
 3. Declare all `4xx` and `5xx` responses the operation can produce. The OpenAPI validator will reject responses that are not declared.
 4. Run code generation. Server stubs, client types, and the validator configuration are all derived from the spec.
 
-**OpenAPI annotations that drive middleware behaviour:**
+**OpenAPI annotations:**
 
 | Annotation | Effect |
 |---|---|
-| *(none)* | Public endpoint. Middleware enforces OAuth2 bearer token. Principal derived from token introspection. |
-| `x-internal: true` | Internal endpoint. Middleware enforces mTLS client certificate. Bearer token rejected. |
-| `x-internal: true` + `x-principal: delegated` | Delegated endpoint. Middleware enforces mTLS and asserts a propagated user principal is present. RBAC resolves against the user, not the mTLS CN. |
-
-Service authors must not implement authentication logic in handlers. Authentication and principal population are entirely the middleware's responsibility. A handler that checks the bearer token itself or constructs a principal from headers is a defect.
+| *(none)* | Public endpoint. Visible in public API documentation. |
+| `x-hidden: true` | Internal endpoint. Suppressed from public documentation (Mintlify). No enforcement effect — access is restricted by RBAC policy, not by the annotation. |
 
 ---
 
 ## 8. Controller Behaviour
 
-A service hosts one or more controllers in a single process. The process is bootstrapped via `pkg/manager.Run`, which initialises the Kubernetes client, registers all controller types, and starts the controller-runtime manager. Each controller type is registered through a factory function (conventionally `ControllerFactory`) that wires its watches and reconciler into the manager before startup.
+Each controller is its own binary. `pkg/manager.Run` accepts exactly one `ControllerFactory` and manages exactly one controller type per process invocation. A service that manages N resource types ships N controller binaries, each with its own `main.go` calling `manager.Run` with its own factory.
 
-Each controller manages exactly one resource type. The reconciler is a function that takes a resource and drives it from its current observed state toward its desired state. The manager calls the reconciler when a watch event or a requeue fires. Multiple reconcilers within the same process share the Kubernetes client and the event bus subscription infrastructure, but otherwise operate independently.
-
-> **Why this matters for new services:** a new service that manages N resource types requires N controllers, all registered in the same `pkg/manager.Run` call. Splitting controllers across processes is not the pattern and introduces unnecessary operational complexity.
+Each controller manages exactly one resource type. The reconciler is a function that takes a resource and drives it from its current observed state toward its desired state. The manager calls the reconciler when a watch event or a requeue fires.
 
 ### 8.1 The Work Queue
 
@@ -709,21 +704,29 @@ Transient conditions include, but are not limited to: a dependency not yet provi
 
 A genuine error is an unexpected condition that cannot be resolved by requeueing. Examples: a malformed resource that cannot be processed, an unrecoverable failure in a downstream system, an assertion that should never be false.
 
-- Genuine errors are returned as real errors from the reconcile function. The controller-runtime applies exponential backoff.
 - A genuine error sets the resource's `Available` condition to `ConditionReasonErrored` and writes the error message to `status.conditions`. This is the correct and only channel for surfacing failures the user needs to act on.
 - Genuine errors must be reserved strictly for conditions that are truly unrecoverable without intervention.
+- **Provisioning path:** genuine errors are returned as `reconcile.Result{RequeueAfter: DefaultYieldTimeout}, nil` — a fixed-interval requeue, not an error return. This is a deliberate design choice: returning an error triggers controller-runtime's exponential backoff, which produces slow recovery during transient infrastructure instability and a poor UX (users see a growing gap between retries). Fixed-interval requeue keeps recovery fast and visible via `ConditionReasonErrored`.
+- **Deprovisioning path:** genuine errors are returned as real errors (`reconcile.Result{}, err`). The controller-runtime applies exponential backoff. Deprovisioning failures are more serious consistency problems; the slower retry is acceptable and the backoff reduces noise.
 
 ### 8.4 Status Conditions
 
-Every pass through the reconcile function, successful or not, must update the resource's `Available` condition before returning. This is unconditional — a reconcile that exits without writing status has failed its contract with the queue.
+Every pass through the reconcile function, successful or not, must update the resource's `Available` condition before returning. Two legitimate exceptions exist where the reconciler exits without writing status:
+
+- **Resource already deleted** — `DeletionTimestamp` is set but no finalizers remain; the resource is awaiting Kubernetes GC. There is nothing to write to.
+- **Resource is paused** — the `Paused()` annotation is set. The controller exits immediately; the resource retains its last-written condition until unpaused.
+
+In all other cases, a reconcile that exits without writing status has failed its contract with the queue.
 
 | Outcome | Condition | Queue behaviour |
 |---|---|---|
 | Transient (`ErrYield`) | `ConditionReasonProvisioning` or `ConditionReasonDeprovisioning` | Requeued at fixed interval |
-| Genuine error | `ConditionReasonErrored` | Requeued with exponential backoff |
+| Genuine error (provisioning) | `ConditionReasonErrored` | Requeued at fixed interval (see §8.3) |
+| Genuine error (deprovisioning) | `ConditionReasonErrored` | Requeued with exponential backoff |
+| Context cancelled (shutdown) | `ConditionReasonCancelled` | Requeued at fixed interval; condition clears on next reconcile |
 | Success | `ConditionReasonProvisioned` or `ConditionReasonDeprovisioned` | Removed from queue |
 
-If the status write itself fails (e.g. due to a resource version conflict), the controller must not return an error. It must requeue with a fixed timeout. A status write failure is a transient queue item — it must not trigger exponential backoff.
+If the status write itself fails (e.g. due to a resource version conflict), the controller must return `reconcile.Result{RequeueAfter: DefaultYieldTimeout}, nil` — not an error. A status write failure is a transient queue item; returning an error would trigger exponential backoff, which must not happen for infrastructure-level retries.
 
 ### 8.5 Finalizer Lifecycle
 
@@ -751,22 +754,21 @@ When a controller receives an error response from a downstream service call:
 | Response | Treatment |
 |---|---|
 | 5xx | Transient. Retry silently. |
-| 404 | Genuine error. A 404 from a downstream service indicates a data inconsistency that will not resolve on retry. Surface as `ConditionReasonErrored`. |
+| 404 (provisioning) | Genuine error. During provisioning or update, a 404 from a downstream dependency indicates a data inconsistency: the API validates all references at creation time, so a dependency that was present at create time should not disappear mid-provisioning except via a deletion event (which would trigger this resource's own deprovisioning). Surface as `ConditionReasonErrored`. |
+| 404 (deprovisioning) | Silently accepted. During teardown, a 404 from a downstream service means the resource is already gone — the cleanup goal is already achieved. Do not surface as an error. |
 | 403 | Genuine error. A permission failure will not resolve without intervention. |
-| 401 | Transient for a bounded number of retries. If the condition persists, surface as `ConditionReasonErrored`. |
+| 401 | Transient for a bounded number of retries. If the condition persists, surface as `ConditionReasonErrored`. No core library primitive for retry counting exists; controllers that implement this must track retries themselves (e.g. via an annotation or condition message). |
 | 409 | Transient. A write conflict resolves on retry with re-read. |
 
 Controllers must not call downstream services to check whether a dependency is provisioned. Dependency readiness is inferred from local status conditions populated by status propagation upward ([section 5.8](#58-status-propagation)). Actively polling a downstream service for readiness reintroduces the tight coupling the event-driven model exists to eliminate.
 
 ### 8.8 Deletion Deadlock Detection
 
-On every reconcile pass of a resource in DELETING state, the controller checks the age of the deletion timestamp. If the deletion timestamp has been set for longer than the configured deadlock threshold and inbound references are still present, the controller emits a structured error log entry via Uber zap.
+A resource that holds a deletion timestamp for an extended period with inbound references still present is in a deadlock: the holder is not releasing its reference, and the resource cannot complete deletion until it does.
 
-The deadlock log entry must include as structured fields: resource type, resource ID, deletion timestamp, elapsed duration, and the full set of blocking reference strings. These fields must be present as discrete zap fields — not embedded in a free-form message string — so they are indexable and queryable in Loki.
+**Current state:** There is no platform-level deadlock detection built into the controller framework. Detection is currently done ad-hoc (UI dashboards checking for resources in DELETING state beyond a threshold; kube-state-metrics). The intended direction is to internalize this as a generic platform mechanism that emits a structured event to a configurable sink when a deadlock threshold is crossed, eliminating the need for per-deployment workarounds.
 
-The deadlock threshold is **10 minutes**. A resource holding a deletion timestamp for longer than 10 minutes with references still present is anomalous and warrants operator attention.
-
-Forcibly clearing a reference to resolve a deadlock must only be done by an operator who has identified why the reference is held and confirmed that the holding controller will not resume and attempt to use the resource.
+**Operator guidance (interim):** A resource holding a deletion timestamp for longer than an hour with references present is anomalous. Forcibly clearing a reference to resolve a deadlock must only be done by an operator who has confirmed the holding controller will not resume and attempt to use the resource.
 
 ### 8.9 Status Projection and Monitoring
 
@@ -778,7 +780,7 @@ Services that manage cloud resources therefore run a monitor process alongside t
 
 A new service that manages cloud resources must account for both. Relying solely on controller reconciles to reflect provider reality is insufficient.
 
-> **Current limitation:** There is no formal ownership partitioning of `status.conditions` between the controller and the monitor. Both write to the same condition list; the last writer wins. By convention the controller writes lifecycle conditions and the monitor writes observed-state conditions, but this partitioning is not enforced by the framework.
+**Condition ownership convention.** The controller and the monitor both write to `status.conditions`. By convention the controller owns lifecycle conditions (Provisioning, Provisioned, Deprovisioning, Deprovisioned, Errored) and the monitor owns observed-state conditions (power state, health). Implementations must respect this partitioning to avoid the last-writer-wins race overwriting a terminal lifecycle condition with a stale observed-state value. This partitioning is not enforced by the framework; it is a required implementation discipline.
 
 ---
 
@@ -838,7 +840,7 @@ All platform services must expose Prometheus metrics.
 - Reconcile duration (histogram)
 - Reconcile outcome (counter by outcome: success, transient, error)
 - Work queue depth (gauge)
-- Reference operation count (counter by operation: add, remove, and outcome)
+- Reference operation count (counter by operation: add, remove, and outcome) — not yet standardised in the core library; recommended for services with high reference contention
 
 **API handlers** must emit at minimum:
 - Request duration (histogram by endpoint and status class)
@@ -864,7 +866,7 @@ RBAC as defined in [section 4.3](#43-rbac) is the enforcement mechanism for Publ
 
 The following invariants apply unconditionally to all platform components. Any implementation that violates them is a defect, not a design trade-off.
 
-- **No privilege escalation** — no operation may grant a principal more access than they already hold. Impersonation can only narrow a user's effective permissions (via ACL intersection with the service's own ACL); it can never expand them. See [section 4.6.1](#acl-intersection-under-impersonation).
+- **No privilege escalation** — no operation may grant a principal more access than they already hold. Impersonation can only narrow a user's effective permissions (via ACL intersection with the service's own ACL); it can never expand them. See [section 4.6.1](#461-acl-intersection-under-impersonation).
 - **Principle of least authority** — each actor (service or user) operates with only the permissions required for the current operation. Services must not accumulate permissions beyond their functional scope, and must not forward a user's full ACL when acting as a proxy.
 - **Scope confinement** — access granted at a narrower scope (project, organisation) does not implicitly confer access at a broader scope. The scope hierarchy is strictly one-directional: broader grants cover narrower scopes, never the reverse. See [section 4.3](#43-rbac).
 - **Single enforcement point** — all access decisions are made against the ACL returned by the identity service. There is no local policy evaluation in individual services. Duplicating or caching access logic outside the ACL endpoint is a defect.
@@ -886,14 +888,15 @@ The core library is not a deployed service. It is a shared Go library that provi
 | `pkg/apis/unikorn/v1alpha1` | Managed resource interfaces (`ManagableResourceInterface`, `ReconcilePauser`, `StatusConditionReader`, `StatusConditionWriter`). Shared value types: `SemanticVersion`, `IPv4Address`, `Tag`. The canonical condition vocabulary. All resources participating in the controller/provisioner lifecycle must implement these interfaces. |
 | `pkg/client` | Kubernetes client construction. mTLS HTTP client setup from cert-manager secrets. Do not construct clients ad hoc. |
 | `pkg/constants` | Platform-wide metadata label keys and annotation keys. The `Finalizer` constant. `DefaultYieldTimeout`. `LabelPriorities` — the canonical ordering for label-tuple identity paths. Any new label or annotation key must be added here. |
-| `pkg/errors` | Sentinel errors: `ErrConsistency`, `ErrResourceNotFound`, `ErrConflict`. Wrap with `%w`; branch with `errors.Is`. |
-| `pkg/manager` | Controller-runtime integration. The generic `Reconciler`. Resource reference helpers. `ResourceReady()` — returns `ErrYield` when a dependency is not yet provisioned; use this rather than polling a downstream service. |
+| `pkg/errors` | Sentinel errors: `ErrConsistency`, `ErrResourceNotFound`, `ErrConflict`, `ErrTypeConversion`. Wrap with `%w`; branch with `errors.Is`. |
+| `pkg/manager` | Controller-runtime integration. The generic `Reconciler`. Resource reference helpers. `ResourceReady()` — returns `ErrYield` when a dependency is not yet provisioned; use this rather than polling a downstream service. (`ErrYield` is defined in `pkg/provisioners` but emitted from here — both packages must be understood together.) |
 | `pkg/messaging` | Event bus publisher and consumer. Use for all cross-service deletion and status propagation. Do not subscribe to another service's storage directly. |
 | `pkg/options` | Process bootstrap: namespace, logging (zap + controller-runtime), OpenTelemetry (tracer, meter, OTLP export). All services use this as their startup base. |
 | `pkg/provisioners` | The `Provisioner` interface and `ErrYield`. Combinators: `serial` (ordered, stop on first yield), `concurrent` (parallel, independent children), `conditional` (provision or actively deprovision based on a predicate). Use combinators to compose complex provisioning logic rather than writing ad hoc orchestration. |
 | `pkg/server/conversion` | `NewObjectMetadata` (create path) and `UpdateObjectMetadata` (update path) for constructing and mutating platform-standard resource metadata. Status mapping: deletion takes precedence over provisioning state. Tag conversion between Kubernetes and OpenAPI representations. |
 | `pkg/server/errors` | Canonical error constructors: `HTTPNotFound`, `HTTPConflict`, `AccessDenied`, `OAuth2InvalidRequest`. `HandleError` normalises arbitrary failures to the platform error contract. `PropagateError` adapts generated OpenAPI client error responses. Never construct error responses manually. |
-| `pkg/server/middleware` | Pre-routing middleware components: OpenTelemetry, logging, route resolver, CORS. These are the components assembled in §7.2.2. |
+| `pkg/server/middleware` | Pre-routing middleware components: OpenTelemetry, logging, route resolver, CORS, timeout. These are the components assembled in §7.2.2. |
+| `identity/pkg/middleware/audit` | `audit.Middleware` — post-routing middleware that emits structured audit log entries. Lives in the Identity service, not core, because audit logging depends on identity-specific principal and ACL context. Import from `github.com/unikorn-cloud/identity/pkg/middleware/audit`. |
 | `pkg/server/saga` | Synchronous in-process saga coordinator. Best-effort rollback on failure. Use for any handler that produces side effects across multiple systems. |
 | `pkg/util` | `GenerateResourceID` — Kubernetes-safe random UUID v4. `ServiceDescriptor` — service name/version/revision for identity in logs and telemetry. |
 
@@ -908,30 +911,29 @@ The core library is not a deployed service. It is a shared Go library that provi
 | CN | X.509 Common Name — service identity for mTLS; maps to an RBAC role |
 | ComputeInstance | User-visible resource owned by the Compute service; realised via a hidden Region Server |
 | CRD | Custom Resource Definition — Kubernetes extension for all platform resource types |
-| DAG | Directed Acyclic Graph — structure of resource containment and access scope hierarchy |
 | Data Boundary | Each service exclusively owns its data; others access only via versioned API |
-| DELETING | Deletion state: tombstoned, blocks while references exist |
-| DRAINING | Deletion state: references cleared, cleaning owned children |
-| FINALIZING | Deletion state: children gone, releasing references on parent resources |
+| DELETING | Deletion phase: `DeletionTimestamp` set, blocks while reference finalizers exist. API-visible condition: `ConditionReasonDeprovisioning`. |
+| DRAINING | Deletion phase: all reference finalizers cleared, reconciler cleaning owned children. API-visible condition: `ConditionReasonDeprovisioning`. |
+| FINALIZING | Deletion phase: children gone, reconciler releasing outbound references and removing its own finalizer. API-visible condition: `ConditionReasonDeprovisioning`. |
 | DELETED | Deletion state: all references released, resource garbage collected |
 | Group | Organisation-scoped collection of users and service accounts; the primary route to RBAC role assignment |
-| `infra-manager-service` | System account RBAC role held by the infrastructure manager service: read on regions; read and delete on identities and physical networks |
 | OAuth2Provider | Identity service resource representing an organisation's upstream OIDC provider configuration; the federation target for user authentication |
 | OAuth2Client | Identity service resource representing a client application permitted to initiate the OAuth2 authorisation code flow |
 | Pause | Operator annotation that halts all controller reconciliation on a resource. The resource remains in its current condition until unpaused. |
-| Tag | User-defined key-value metadata on a resource (`spec.tags`). User-defined values are opaque to the platform; platform-reserved keys in service namespaces (e.g. `compute.unikorn-cloud.org/*`) are used for internal resource coordination. Filtered post-list in-process. Does not affect RBAC, scoping, or storage queries. |
+| Tag | User-defined key-value metadata on a resource (`spec.tags`). User-defined values are opaque to the platform; platform-reserved keys in service namespaces (e.g. `compute.unikorn-cloud.org:instance-id`) are used for internal resource coordination. Filtered post-list in-process. Does not affect RBAC, scoping, or storage queries. |
 | Identity (Region) | Cloud project/user/credentials provisioned by the Region service for a consuming service |
 | mTLS | Mutual TLS — both sides present certificates; all service-to-service auth |
 | OIDC | OpenID Connect — end-user authentication protocol |
-| Containment Edge | Edge carrying scope propagation and forward deletion propagation; resource cannot exist outside the scope of its container |
+| Containment Edge | Edge carrying scope propagation and (opt-in) forward deletion propagation; resource cannot exist outside the scope of its container |
 | Principal | Originating end-user or service account responsible for a resource; determines quota and billing |
 | Consumption Edge | Edge carrying reverse deletion propagation (blocking) and co-location; resource uses another it does not contain |
 | Dependency Edge | Edge carrying reverse deletion propagation (triggering) and co-location; deletion of target triggers deletion of source |
 | `ErrYield` | Sentinel error signalling expected transient blocking; triggers fixed-period requeue, not exponential backoff |
+| `ConditionReasonCancelled` | Condition reason set when a reconcile is interrupted by context cancellation (controller shutdown). The resource retains this condition until the next reconcile pass, at which point it is overwritten by the normal outcome. |
 | Project | Organisational workspace; root scope for all user resources |
 | Protected Role | RBAC role hidden from public API; grantable only via Helm values |
 | Proxy | A service acting on behalf of a principal to provision resources |
-| Reference | Named dependency claim on a resource; blocks deletion until removed |
+| Reference | Named dependency claim on a resource implemented as a Kubernetes finalizer on the target; blocks deletion until removed |
 | Region | A registered cloud provider instance |
 | ServiceAccount | Organisation-bound non-human identity managed by the Identity service; authenticated via bearer token; authority derived from group membership |
 | SigningKey | Identity service resource holding the active and previous JWT signing key pair; governs token issuance and rolling verification |
@@ -943,8 +945,7 @@ The core library is not a deployed service. It is a shared Go library that provi
 | UUID v5 | Deterministically generated UUID (RFC 4122). Used only for index resources whose sole purpose is uniqueness enforcement. Never used for resources carrying billing, quota, or audit identity. See Appendix A.1. |
 | `unikorn-client-issuer` | Root CA for all inter-service mTLS |
 | Delegated Principal | A user principal propagated by a proxy service across an internal API boundary. The transport is mTLS; the actor for RBAC, quota, billing, and audit is the user, not the proxy. See [section 4.5.1](#451-api-authentication-classifications). |
-| `x-internal: true` | OpenAPI operation extension marking an endpoint as internal. Middleware enforces mTLS client certificate authentication and rejects OAuth2 bearer tokens. |
-| `x-principal: delegated` | OpenAPI operation extension used with `x-internal: true`. Middleware asserts a user principal must be present in the request context. RBAC resolves against the user principal, not the mTLS CN. |
+| `x-hidden: true` | OpenAPI operation extension that suppresses an endpoint from public documentation (Mintlify). Documentation marker only — no middleware enforcement effect. |
 
 ---
 
@@ -1030,7 +1031,7 @@ Use this checklist when introducing a new service to the platform. Each item map
 
 **API Design**
 - [ ] OpenAPI spec written first, before any Go code ([§7.11](#711-openapi-first-development))
-- [ ] Every endpoint annotated with its authentication classification (`x-internal`, `x-principal: delegated`, or default) ([§4.5.1](#451-api-authentication-classifications), [§7.2.1](#721-handler-authentication-classification))
+- [ ] Internal endpoints annotated with `x-hidden: true` (documentation visibility only); access restricted by RBAC policy; handler resolves principal per §4.5.1 and §4.6 ([§7.2.1](#721-handler-authentication-classification))
 - [ ] All possible `4xx`/`5xx` responses declared in the OpenAPI spec ([§7.9](#79-error-handling-and-propagation))
 - [ ] API follows the v2 flat routing model; no organisation/project in URL path ([§7.10](#710-v2-api-design-model))
 - [ ] Server stubs, client types, and validator generated from the OpenAPI spec
@@ -1066,13 +1067,13 @@ Use this checklist when introducing a new service to the platform. Each item map
 - [ ] References placed and released by the controller, never the handler ([§5.3](#53-references))
 
 **Controllers**
-- [ ] All controllers registered via `pkg/manager.Run` in a single process ([§8](#8-controller-behaviour))
+- [ ] Each controller type is a separate binary, each calling `pkg/manager.Run` with its own factory ([§8](#8-controller-behaviour))
 - [ ] Each reconcile pass checks `DeletionTimestamp` first; finalizer added unconditionally before provisioning ([§8.5](#85-finalizer-lifecycle))
-- [ ] Every reconcile pass writes `status.conditions` unconditionally before returning ([§8.4](#84-status-conditions))
+- [ ] Every reconcile pass writes `status.conditions` before returning (except: resource already deleted with no finalizers, or resource is paused) ([§8.4](#84-status-conditions))
 - [ ] Transient conditions return `ErrYield`; genuine errors returned as errors ([§8.2](#82-transient-conditions-and-silent-retry), [§8.3](#83-genuine-errors))
 - [ ] Reconciliation is idempotent; handles duplicate events without side effects ([§8.1](#81-the-work-queue))
 - [ ] Status propagation upward implemented via explicit watch or event bus subscription ([§5.8](#58-status-propagation), [§8.6](#86-controller-watches))
-- [ ] Deletion deadlock detection emits structured log after 10-minute threshold ([§8.8](#88-deletion-deadlock-detection))
+- [ ] Deletion behaviour reviewed against §8.8 (platform-level deadlock detection not yet available; document any service-specific mitigations)
 
 **Cloud Resource Services** *(if the service manages cloud provider resources)*
 - [ ] Monitor process implemented alongside the controller for observed runtime state ([§8.9](#89-status-projection-and-monitoring))
