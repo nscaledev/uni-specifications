@@ -17,6 +17,7 @@ Nscale Cloud Platform Engineering
    - [2.3 Cloud Provider Abstraction](#23-cloud-provider-abstraction)
    - [2.4 Service Layering and Resource Accountability](#24-service-layering-and-resource-accountability)
 3. [Data Boundaries](#3-data-boundaries)
+   - [3.1 Authority and Derived State](#31-authority-and-derived-state)
 4. [Identity and Access](#4-identity-and-access)
    - [4.1 Organisational Hierarchy](#41-organisational-hierarchy)
    - [4.2 Actors and Representation](#42-actors-and-representation)
@@ -70,6 +71,7 @@ Nscale Cloud Platform Engineering
    - [8.7 Downstream Error Handling](#87-downstream-error-handling)
    - [8.8 Deletion Deadlock Detection](#88-deletion-deadlock-detection)
    - [8.9 Status Projection and Monitoring](#89-status-projection-and-monitoring)
+   - [8.10 Authoritative State for Deprovisioning](#810-authoritative-state-for-deprovisioning)
 9. [Observability](#9-observability)
    - [9.1 Structured Logging](#91-structured-logging)
    - [9.2 Audit Logging](#92-audit-logging)
@@ -88,6 +90,7 @@ Nscale Cloud Platform Engineering
 - [A.4 Update Saga Revert — Broken Compensation](#a4-update-saga-revert--broken-compensation)
 - [A.5 Multi-Step Create With No Saga — Orphaned Cross-Service Resources](#a5-multi-step-create-with-no-saga--orphaned-cross-service-resources)
 - [A.6 Allocation Ownership Inversion](#a6-allocation-ownership-inversion)
+- [A.7 Best-Effort Status Used as Deprovision Authority](#a7-best-effort-status-used-as-deprovision-authority)
 
 **Appendix B**
 
@@ -163,6 +166,23 @@ Each service exclusively owns its data. No other service may read or write that 
 > **Rationale:** If two services share a database or read each other's storage directly, they become coupled at the data layer — schema changes in one break the other, deployment order matters, and the boundary between their responsibilities blurs. Enforcing data boundaries through versioned APIs is the only way to keep services independently deployable and independently understandable.
 
 > **Rule:** Never access another service's CRDs or storage directly. Any code that does so is a defect.
+
+### 3.1 Authority and Derived State
+
+Every fact the platform acts on has exactly one **source of truth** — the system that authoritatively owns that fact. Every other representation of it is **derived state**: a cache, a mirrored record, a projected status field, an event payload. Derived state exists to make observation and coordination cheap; it is best-effort and may be stale, lagging, or entirely absent at the moment it is read.
+
+The source of truth differs by fact, but is always identifiable:
+
+| Fact | Source of truth | Derived (never authoritative) |
+|---|---|---|
+| A service's own resources | The owning service's storage, via its API (§3) | Another service's local copy or cache |
+| A cloud-provider resource's existence | The provider, re-discovered by stable name or tag (§2.3) | The resource identifiers mirrored into CRD status |
+| A strongly-consistent allocation | The allocator record keyed by a stable identity (§7.6) | Any copy of that allocation recorded elsewhere |
+| A dependency's lifecycle state | The owning service, surfaced via status propagation (§5.8) | A controller's own last-reconciled snapshot |
+
+> **Rule:** Derived state must never be the authority for a decision whose correctness depends on the real state — above all a destructive or irreversible one (deleting a resource, freeing an allocation, releasing a reference). Such a decision is made from the source of truth, re-read at the point of action. Derived state may be used to *optimise* (skip obviously-unnecessary work) but never to *authorise* skipping a step whose omission leaks or corrupts real state.
+
+> **Rationale:** Projected status is written best-effort, after the fact, and a write can be lost to a crash, a resource-version conflict, or a reconcile that re-derives it from scratch. The absence of a record is therefore not evidence of the absence of the thing it would record. A cleanup step gated on "did we record this?" silently degrades to a no-op whenever that write was lost — and leaks the underlying resource. The authoritative system already knows the truth; ask it rather than trusting a mirror of it. See [§8.10](#810-authoritative-state-for-deprovisioning) for the deprovisioning rule this implies, and [Appendix A.7](#a7-best-effort-status-used-as-deprovision-authority) for the incident class it prevents.
 
 ---
 
@@ -424,6 +444,7 @@ Adding a new resource type to the graph is a formal exercise. For each relations
 - Cascading must never propagate across consumption or dependency edges to resources outside the subtree.
 - Inter-service deletion ordering uses Kubernetes finalizers only. Spec fields must not be used — spec is immutable once a deletion timestamp is set.
 - Intra-service ordering may use owner references and blocking deletes.
+- Each deprovision step is driven from the source of truth and is idempotent. A step must never be gated on best-effort recorded status — absence of a status record is not evidence the underlying resource is absent (see [§3.1](#31-authority-and-derived-state), [§8.10](#810-authoritative-state-for-deprovisioning)).
 
 ### 5.12 Deletion State Machine
 
@@ -784,6 +805,22 @@ A new service that manages cloud resources must account for both. Relying solely
 
 **Condition ownership convention.** The controller and the monitor both write to `status.conditions`. By convention the controller owns lifecycle conditions (Provisioning, Provisioned, Deprovisioning, Deprovisioned, Errored) and the monitor owns observed-state conditions (power state, health). Implementations must respect this partitioning to avoid the last-writer-wins race overwriting a terminal lifecycle condition with a stale observed-state value. This partitioning is not enforced by the framework; it is a required implementation discipline.
 
+Projected status is therefore observational by construction: it reflects the last poll, not the present. It is derived state ([§3.1](#31-authority-and-derived-state)). It must never be the authority for a decision about the controller's *own* backing provider state — above all a destructive one: where a decision turns on whether a provider resource this controller owns exists, query the provider, and do not infer its existence or non-existence from projected status (see [§8.10](#810-authoritative-state-for-deprovisioning)). This is distinct from a *dependency's* readiness, which is by design inferred from propagated status and must not be rechecked by polling the owning service ([§8.7](#87-downstream-error-handling)): there, propagated status is the channel through which the owner's source of truth is surfaced ([§3.1](#31-authority-and-derived-state)), not a mirror of state this controller itself owns.
+
+### 8.10 Authoritative State for Deprovisioning
+
+Deprovisioning acts on real, often irreversible state. Every cleanup step must be:
+
+- **Unconditional at the call site.** The decision to *attempt* a cleanup step is not gated on a readiness condition or on best-effort recorded status. Once a deletion timestamp is set the deprovision path runs ([§8.5](#85-finalizer-lifecycle)); it delegates each cleanup step unconditionally.
+- **Idempotent and partial-state tolerant.** The step re-discovers what actually exists from the source of truth ([§3.1](#31-authority-and-derived-state)), treats an already-absent resource as success (the 404-on-deprovision rule, [§8.7](#87-downstream-error-handling)), and treats a dependency that was never realised as a no-op rather than an error.
+- **Independently gated.** Where teardown has multiple steps — provider cleanup, reference release, allocation/quota release — each is gated only on the concrete state *it* needs. A single broad precondition covering all of them is a defect: it couples independent steps and lets one unmet condition skip the others.
+
+> **Rule:** A cleanup step must not be skipped because recorded status does not mention the resource. Recorded status is derived state; absence of a record is not evidence of absence of the resource ([§3.1](#31-authority-and-derived-state)). Re-discover from the source of truth and act idempotently.
+
+This does not conflict with [§8.7](#87-downstream-error-handling). That rule forbids polling a *downstream service* to learn a *dependency's provisioning readiness* — coupling that status propagation ([§5.8](#58-status-propagation)) replaces. The present rule concerns a controller acting on *its own* owned backing state during teardown, for which the owning system — the cloud provider, the allocator — is the source of truth and must be consulted rather than trusted to match a local mirror. Readiness of someone else's resource is inferred from propagated status; existence of your own backing resource is rediscovered authoritatively.
+
+> **Rationale:** The failure mode is silent and unbounded. A cleanup gated on recorded status leaks every time the status write was lost (crash, conflict, status reset on a re-reconcile) — and because the controller's finalizer is removed when deprovision returns success, the owning resource is garbage-collected while the orphaned backing resource or allocation persists with nothing left to trigger its cleanup. The leak is then only discoverable by reconciling the provider against the allocator out of band. See [Appendix A.7](#a7-best-effort-status-used-as-deprovision-authority).
+
 ---
 
 ## 9. Observability
@@ -1027,6 +1064,19 @@ Pagination has not yet been implemented. This is a known scaling limitation.
 
 **Required pattern:** `handler.Delete` must not release the allocation. It deletes only the local resource (setting the deletion timestamp). The controller's deprovision path is solely responsible for releasing the allocation before removing its finalizer.
 
+### A.7 Best-Effort Status Used as Deprovision Authority
+
+**Status: resolved in Region; recorded so the pattern is not reintroduced.**
+
+**Symptoms:**
+- A deprovision step is gated on a predicate that reads projected status — e.g. `if statusRecordsProviderResourceIDs(resource) { provider.Delete(...) }` — or on parent readiness, so the destructive call is skipped when status is empty.
+- A single broad predicate gates several unrelated teardown steps (provider cleanup, reference release, allocation release) together.
+- Symptom in the field: an allocation or backing cloud resource survives after the owning resource is gone, discoverable only by reconciling the provider/allocator out of band.
+
+**Defect:** projected status is derived state ([§3.1](#31-authority-and-derived-state)). It is written best-effort and after the side effect it records, so a lost write (crash, resource-version conflict, or a reconcile that resets status before re-deriving it) makes the predicate read "nothing was created" when something was. The cleanup is skipped, the controller's finalizer is removed on apparent success, and the owning resource is garbage-collected while the real resource leaks. Concrete instance: a provider-network VLAN was allocated and the backing network create then failed before status was persisted; on the cascade delete the status-gated provider cleanup was skipped and the VLAN allocation was orphaned.
+
+**Required pattern:** delegate each deprovision step unconditionally and make it idempotent ([§8.10](#810-authoritative-state-for-deprovisioning)). The provider rediscovers its resources from the source of truth (by stable name/tag) and frees allocations keyed by stable identity; an already-absent resource or a never-realised dependency is a no-op, not a skip and not an error. Gate each teardown step only on the concrete state it needs, never on a shared best-effort precondition.
+
 ---
 
 ## Appendix B: Reference Checklists
@@ -1078,6 +1128,7 @@ Use this checklist when introducing a new service to the platform. Each item map
 - [ ] Every reconcile pass writes `status.conditions` before returning (except: resource already deleted with no finalizers, or resource is paused) ([§8.4](#84-status-conditions))
 - [ ] Transient conditions return `ErrYield`; genuine errors returned as errors ([§8.2](#82-transient-conditions-and-silent-retry), [§8.3](#83-genuine-errors))
 - [ ] Reconciliation is idempotent; handles duplicate events without side effects ([§8.1](#81-the-work-queue))
+- [ ] Each deprovision step delegated unconditionally and is idempotent; none gated on best-effort recorded status; each teardown step gated only on the concrete state it needs ([§8.10](#810-authoritative-state-for-deprovisioning), [Appendix A.7](#a7-best-effort-status-used-as-deprovision-authority))
 - [ ] Status propagation upward implemented via explicit watch or event bus subscription ([§5.8](#58-status-propagation), [§8.6](#86-controller-watches))
 - [ ] Deletion behaviour reviewed against §8.8 (platform-level deadlock detection not yet available; document any service-specific mitigations)
 
