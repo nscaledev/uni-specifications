@@ -6,6 +6,10 @@ The **[Unified Architectural Specification](SPECIFICATION.md)** is the single so
 
 Each service repository contains a `CLAUDE.md` that references this document. AI agents should fetch the raw content of `SPECIFICATION.md` directly for full platform context.
 
+## Region Specifications
+
+* [Server Provider Create Gates](specifications/region/server-provider-create-gates.md)
+
 ## Provider-Specific Specifications
 
 Provider-specific configuration that sits below the platform abstraction boundary is documented separately:
