@@ -887,6 +887,12 @@ All platform services must expose Prometheus metrics.
 
 Metric naming must follow Prometheus conventions: `snake_case`, service-prefixed, with unit suffixes where applicable (e.g. `_seconds`, `_total`). Shared metric definitions belong in the core library.
 
+**Exposure.** Metrics are scraped, never pushed. Every process — API server, controller, or monitor — must serve a Prometheus endpoint at `/metrics` on port `8080` (or another port declared in its Deployment). A declared metrics port with nothing listening on it is a defect: the scrape target reports down and the process's metrics are lost.
+
+- All instruments must be registered on the controller-runtime registry via the core library's meter provider (`pkg/options`), so that OpenTelemetry instruments and controller-runtime's own metrics appear on one endpoint. A controller-runtime manager serves this registry itself; processes without a manager serve it via `CoreOptions.ServeMetrics`.
+- OTLP carries traces only ([§9.3](#93-distributed-tracing)). Services must not export metrics over OTLP, and must not depend on any metric reaching a store by a path other than the scrape.
+- Scrape configuration (PodMonitor or ServiceMonitor) is owned by the deployment, not the service. The scraper owns the `job` and `instance` labels; dashboards and alerts must not depend on them. The scraper copies the pod `app` label onto each series, and that is the label by which a service's metrics are identified.
+
 ---
 
 ## 10. Security
@@ -930,7 +936,7 @@ The core library is not a deployed service. It is a shared Go library that provi
 | `pkg/errors` | Sentinel errors: `ErrConsistency`, `ErrResourceNotFound`, `ErrConflict`, `ErrTypeConversion`. Wrap with `%w`; branch with `errors.Is`. |
 | `pkg/manager` | Controller-runtime integration. The generic `Reconciler`. Resource reference helpers. `ResourceReady()` — returns `ErrYield` when a dependency is not yet provisioned; use this rather than polling a downstream service. (`ErrYield` is defined in `pkg/provisioners` but emitted from here — both packages must be understood together.) |
 | `pkg/messaging` | Event bus publisher and consumer. Use for all cross-service deletion and status propagation. Do not subscribe to another service's storage directly. |
-| `pkg/options` | Process bootstrap: namespace, logging (zap + controller-runtime), OpenTelemetry (tracer, meter, OTLP export). All services use this as their startup base. |
+| `pkg/options` | Process bootstrap: namespace, logging (zap + controller-runtime), OpenTelemetry (tracer with OTLP export; meter exporting to the controller-runtime registry for scraping). All services use this as their startup base. |
 | `pkg/provisioners` | The `Provisioner` interface and `ErrYield`. Combinators: `serial` (ordered, stop on first yield), `concurrent` (parallel, independent children), `conditional` (provision or actively deprovision based on a predicate). Use combinators to compose complex provisioning logic rather than writing ad hoc orchestration. |
 | `pkg/server/conversion` | `NewObjectMetadata` (create path, random UUID v4) and `NewDeterministicObjectMetadata` (create path, UUID v5 from caller-supplied namespace UUID and invariant string) for constructing platform-standard resource metadata. `UpdateObjectMetadata` for mutation on update. Status mapping: deletion takes precedence over provisioning state. Tag conversion between Kubernetes and OpenAPI representations. |
 | `pkg/server/errors` | Canonical error constructors: `HTTPNotFound`, `HTTPConflict`, `AccessDenied`, `OAuth2InvalidRequest`. `HandleError` normalises arbitrary failures to the platform error contract. `PropagateError` adapts generated OpenAPI client error responses. Never construct error responses manually. |
@@ -1143,7 +1149,8 @@ Use this checklist when introducing a new service to the platform. Each item map
 - [ ] Uber zap structured logging initialised; controller-runtime logger set to zap backend ([§9.1](#91-structured-logging))
 - [ ] Process bootstrapped via `pkg/options` for logging, OpenTelemetry, and namespace configuration ([§11](#11-core-library))
 - [ ] OpenTelemetry spans created for all inbound requests and controller reconcile passes ([§9.3](#93-distributed-tracing))
-- [ ] Prometheus metrics exposed: reconcile duration, reconcile outcome, work queue depth ([§9.4](#94-metrics))
+- [ ] Prometheus metrics exposed: reconcile duration, reconcile outcome, work queue depth; request duration and count for API servers ([§9.4](#94-metrics))
+- [ ] Every process serves `/metrics` on its declared port, registered via the core meter provider; no metrics exported over OTLP ([§9.4](#94-metrics))
 - [ ] Audit logging emitted automatically by `audit.Middleware`; no manual audit writes in handlers ([§9.2](#92-audit-logging))
 
 **Data Boundaries**
