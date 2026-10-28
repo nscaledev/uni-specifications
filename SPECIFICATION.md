@@ -889,9 +889,9 @@ Metric naming must follow Prometheus conventions: `snake_case`, service-prefixed
 
 **Exposure.** Metrics are scraped, never pushed. Every process — API server, controller, or monitor — must serve a Prometheus endpoint at `/metrics` on port `8080` (or another port declared in its Deployment). A declared metrics port with nothing listening on it is a defect: the scrape target reports down and the process's metrics are lost.
 
-- All instruments must be registered on the controller-runtime registry via the core library's meter provider (`pkg/options`), so that OpenTelemetry instruments and controller-runtime's own metrics appear on one endpoint. A controller-runtime manager serves this registry itself; processes without a manager serve it via `CoreOptions.ServeMetrics`.
+- All instruments must be registered on the controller-runtime registry via the core library's meter provider (`pkg/options`), so that OpenTelemetry instruments and controller-runtime's own metrics appear on one endpoint. A controller-runtime manager serves this registry itself; processes without a manager serve it via `CoreOptions.RunWithMetrics`, which stops the process if its metrics cannot be served, as a manager does when its metrics server fails.
 - OTLP carries traces only ([§9.3](#93-distributed-tracing)). Services must not export metrics over OTLP, and must not depend on any metric reaching a store by a path other than the scrape.
-- Scrape configuration (PodMonitor or ServiceMonitor) is owned by the deployment, not the service. The scraper owns the `job` and `instance` labels; dashboards and alerts must not depend on them. The scraper copies the pod `app` label onto each series, and that is the label by which a service's metrics are identified.
+- Scrape configuration (PodMonitor or ServiceMonitor) is owned by the deployment, not the service. The scraper owns the `job` and `instance` labels; dashboards and alerts must not depend on them. A service's metrics are identified by the `service` label, which the core library sets in code to one value for every binary in the service; the core library's metrics documentation defines the labels dashboards and alerts may rely on.
 
 ---
 
