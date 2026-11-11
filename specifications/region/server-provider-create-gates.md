@@ -90,11 +90,14 @@ semantics:
 type ServerProviderCreateGateStatus struct {
     // ConditionType matches ServerProviderCreateGate.ConditionType.
     ConditionType string `json:"conditionType"`
-    // Status is True, False, or Unknown.
+    // Status is True (satisfied), False (withheld by its satisfier), or
+    // Unknown (not reported yet, or reset by Region).
     Status corev1.ConditionStatus `json:"status"`
     // LastTransitionTime records when status last changed.
     LastTransitionTime metav1.Time `json:"lastTransitionTime"`
-    // Actor is the mTLS service identity that last wrote this gate status.
+    // Actor is the authenticated identity that last wrote this gate status:
+    // the client certificate's common name when the caller presented one,
+    // otherwise the token's subject, otherwise its OAuth client ID.
     Actor string `json:"actor"`
     // Reason is a machine-readable reason.
     Reason string `json:"reason"`
@@ -186,6 +189,27 @@ If any gate remains, the controller yields and retries later. It must not call
 the provider and must not mark the server as failed merely because a pre-create
 service has not finished.
 
+A remaining gate is handled like any other dependency that is not ready:
+
+- a gate that is `Unknown` or has no status entry is a dependency not ready yet
+  (`DependencyNotReady`)
+- a gate its satisfier has withheld (`False`, see Withhold Gate) is a failed
+  dependency (`DependencyFailed`)
+
+Neither is terminal. Both read as `provisioning` in the API, never as `error`,
+and the controller waits on its normal requeue rather than retrying faster.
+A gate that is withheld today may open later, for example once capacity is
+freed or the host is fixed, and the server must carry on by itself when it
+does. Reporting an error instead would also raise one alarm per server, and
+per tenant through anything that mirrors server state, for what is a single
+fault in the pre-create service.
+
+The condition Region writes carries Region's own fixed message naming the
+gate, for example `provider create gate "example.unikorn-cloud.org/pre-create-ready"
+reported it cannot be satisfied yet`. The satisfier's reason and message stay
+on the gate status and in logs: condition text can be passed through to
+customers, and a pre-create service's diagnostics are not written for them.
+
 Region owns reset semantics. The server controller resets provider-create gate
 status only when it intentionally returns the server to the pre-provider-create
 state and will make a new provider create attempt from scratch. Ordinary
@@ -251,11 +275,12 @@ Rules:
 - the endpoint marks the matching provider-create gate status `True`
 - the endpoint records the supplied `reason` and `message` on the stored object
   for operator diagnostics
-- the endpoint records the authenticated mTLS service identity as the gate
-  status actor; callers do not provide this field
+- the endpoint records the authenticated caller as the gate status actor (see
+  Stored Status); callers do not provide this field
 - the endpoint does not add or remove spec gates
 - repeated writes with the same state are idempotent
-- service callers cannot set a gate back to `False` or `Unknown`
+- satisfying never moves a gate back: once a gate is `True`, only Region
+  changes it, by a reset
 - Region owns resets if the server controller needs pre-create work to run
   again
 
@@ -268,6 +293,44 @@ that is authorized for the provider-create-gate action may satisfy any
 configured gate on a server it can read. Region must write a structured log for
 each accepted gate action, including the server ID, condition type,
 authenticated actor, reason, and whether the action changed the stored status.
+
+### Withhold Gate
+
+A pre-create service that cannot satisfy a gate yet, and knows why, reports it
+as withheld rather than leaving the gate silently unsatisfied:
+
+```http
+POST /api/v2/servers/{serverID}/provider-create-gates/withhold
+```
+
+```json
+{
+  "conditionType": "example.unikorn-cloud.org/pre-create-ready",
+  "reason": "NoCapacity",
+  "message": "The pool this server needs is exhausted"
+}
+```
+
+Rules:
+
+- the server must exist and be readable by the caller
+- `conditionType` must already be present in `Server.spec.providerCreateGates`;
+  otherwise the request is refused (`422`)
+- the endpoint marks the matching provider-create gate status `False` and
+  records the supplied `reason`, `message`, and authenticated actor
+- a gate that is already `True` is refused (`409`) and nothing is written: the
+  gate is checked until the server boots, so moving it back would freeze status
+  on a server that may already be building
+- the request carries only `conditionType`, `reason`, and `message`; any other
+  field, outputs included, is refused (`400`)
+- repeated writes with the same content are idempotent, and a later satisfy
+  opens the gate
+- it uses the same permission as satisfying a gate
+
+Withholding is its own operation rather than an extra field on the satisfy
+request, so that it fails closed. A Region that predates it answers `404`. A new
+field on the satisfy request would instead be ignored by such a Region, which
+always marks the gate `True`, and the gate would open.
 
 ### References
 
@@ -295,7 +358,8 @@ service integration. When it reads a server whose
 1. reads the server's `infrastructureRef`, `networkId`, and `flavorId`
 2. determines whether service-owned pre-create work is required
 3. prepares external state when required
-4. satisfies the provider-create gate through the Region API
+4. satisfies the provider-create gate through the Region API, or, if the work
+   cannot be done yet, withholds it with a reason and tries again later
 
 If no work is required for a particular server, the service still satisfies the
 gate. The gate means "the pre-provider-create service has made its decision",
@@ -310,8 +374,12 @@ not "the service necessarily changed external state".
 - The server read API must expose `status.remainingProviderCreateGates`.
 - The gate action endpoint must only satisfy a configured gate; it must not add
   gates, remove gates, or reset gates.
-- The gate action endpoint must derive the actor from the authenticated mTLS
-  service identity, record it in the stored gate status, and log accepted gate
-  actions.
+- The withhold endpoint must only mark a configured gate that is not `True` as
+  `False`, refusing a gate that is already `True`.
+- A remaining gate must hold provider create without failing the server:
+  `Unknown` or unreported is `DependencyNotReady`, withheld is
+  `DependencyFailed`, both non-terminal, with a Region-owned condition message.
+- The gate endpoints must derive the actor from the authenticated caller,
+  record it in the stored gate status, and log accepted gate actions.
 - The stored object should retain per-gate status, actor, reason, message, and
   transition time for operators.
